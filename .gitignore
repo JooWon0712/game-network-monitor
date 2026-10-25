@@ -1,0 +1,8 @@
+*.exe
+*.pdb
+tests/**/*.txt
+tests/**/*.png
+tests/**/*.csv
+outputs/
+logs/
+.build/
