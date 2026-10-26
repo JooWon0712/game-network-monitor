@@ -6,14 +6,58 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 
 namespace GameNetworkMonitor
 {
     public static class App
     {
+        public const string Version = "0.1.8";
+        private static string exitContext = "명시적 종료 요청 미확인";
+        private static volatile bool unhandledExceptionSeen;
+
         [STAThread]
         public static int Main(string[] args)
+        {
+            string mode = args.Length > 0 ? args[0] : "";
+            string diagnosticRoot = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, IsTestMode(mode) ? "tests\\diagnostic-runs" : "diagnostics");
+            DiagnosticsLog.Initialize(diagnosticRoot, Version, mode.Length == 0 ? "normal" : mode);
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e) {
+                unhandledExceptionSeen = true;
+                DiagnosticsLog.Write("domain_unhandled_exception", "is_terminating=" + e.IsTerminating, e.ExceptionObject as Exception);
+            };
+            TaskScheduler.UnobservedTaskException += delegate(object sender, UnobservedTaskExceptionEventArgs e) {
+                DiagnosticsLog.Write("task_unobserved_exception", "observed=" + e.Observed, e.Exception);
+                // Preserve the runtime's exception policy; do not mark it observed here.
+            };
+            AppDomain.CurrentDomain.ProcessExit += delegate {
+                DiagnosticsLog.Write("process_exit", "exit_code=" + Environment.ExitCode + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
+                DiagnosticsLog.Shutdown("process_exit observed; this event alone does not prove a normal exit");
+            };
+            int result = 1;
+            try { result = Run(args); }
+            catch (Exception error) {
+                unhandledExceptionSeen = true;
+                DiagnosticsLog.Write("entry_failure", "main entry failed", error);
+                if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + error.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "게임 네트워크 모니터");
+            }
+            finally { DiagnosticsLog.Write("main_return", "exit_code=" + result + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen); }
+            return result;
+        }
+
+        public static void NoteExitRequest(string context)
+        {
+            exitContext = context;
+            DiagnosticsLog.Write("exit_request", context);
+        }
+
+        private static bool IsTestMode(string mode)
+        {
+            return mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test";
+        }
+
+        private static int Run(string[] args)
         {
             string mode = args.Length > 0 ? args[0] : "";
             string testDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tests");
@@ -22,16 +66,33 @@ namespace GameNetworkMonitor
                 if (mode == "--self-test")
                 {
                     KernelNetworkMonitor.SelfTest(); ProbeRunner.SelfTest(); MonitorController.SelfTest(); StartupSelection.SelfTest();
-                    AutomaticSessionLog.SelfTest(testDir); SessionAnalysis.SelfTest();
+                    AutomaticSessionLog.SelfTest(testDir); SessionAnalysis.SelfTest(); DiagnosticsLog.SelfTest(testDir); ProgramUsageTotals.SelfTest();
                     ExportTest(testDir);
                     Directory.CreateDirectory(testDir);
-                    File.WriteAllText(Path.Combine(testDir, "self-test.txt"), "PASS: Existing ETW/probe/statistics/CSV/selection checks; automatic file persistence and periodic flush, session preservation, write failure handling; analysis of raw probes, counters, unavailable data, candidate intervals.\r\n", Encoding.UTF8);
+                    File.WriteAllText(Path.Combine(testDir, "self-test.txt"), "PASS v" + Version + ": ETW/probe/statistics/CSV/selection, persistence/error handling, raw-probe analysis, whole-session program send totals/grouping/duplicate intervals.\r\n", Encoding.UTF8);
                     return 0;
                 }
                 if (mode == "--probe-test") { ProbeTest(testDir); return 0; }
                 Application app = new Application();
                 app.ShutdownMode = ShutdownMode.OnMainWindowClose;
+                app.DispatcherUnhandledException += delegate(object sender, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e) {
+                    unhandledExceptionSeen = true;
+                    DiagnosticsLog.Write("dispatcher_unhandled_exception", "handled=" + e.Handled, e.Exception);
+                    // Do not set Handled=true or continue after an unknown UI failure.
+                };
+                app.SessionEnding += delegate(object sender, SessionEndingCancelEventArgs e) { NoteExitRequest("Windows 종료 요청: " + e.ReasonSessionEnding); };
+                app.Exit += delegate(object sender, ExitEventArgs e) {
+                    DiagnosticsLog.Write("application_exit", "exit_code=" + e.ApplicationExitCode + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
+                };
                 MainWindow window = mode == "--recording-test" ? new MainWindow(null, Path.Combine(testDir, "recording-fixture-" + Guid.NewGuid().ToString("N"))) : new MainWindow(StartupSelection.FromArgs(args));
+                if (mode == "--lifecycle-test")
+                {
+                    // Enter the actual WPF dispatcher, then close only this idle test window.
+                    // Do not activate it, start measurement, send probes or request UAC.
+                    window.ShowActivated = false; window.ShowInTaskbar = false; window.WindowState = WindowState.Minimized;
+                    app.Startup += delegate { app.Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.ApplicationIdle, new Action(delegate { window.Close(); })); };
+                    return app.Run(window);
+                }
                 if (mode == "--recording-test")
                 {
                     Directory.CreateDirectory(testDir);
@@ -43,16 +104,18 @@ namespace GameNetworkMonitor
                     Directory.CreateDirectory(testDir);
                     window.SmokeTest(Path.Combine(testDir, "dashboard.png"));
                     window.Close();
-                    File.WriteAllText(Path.Combine(testDir, "smoke-test.txt"), "PASS: Actual WPF dashboard and permission-denied state rendered; selection restoration verified without starting monitoring or invoking UAC.\r\n", Encoding.UTF8);
+                    File.WriteAllText(Path.Combine(testDir, "smoke-test.txt"), "PASS v" + Version + ": WPF summary, two tabs, program cumulative totals, permission state and selection restoration; no live ETW, probes or UAC.\r\n", Encoding.UTF8);
                     app.Shutdown(); return 0;
                 }
                 return app.Run(window);
             }
             catch (Exception e)
             {
-                Directory.CreateDirectory(testDir);
-                File.WriteAllText(Path.Combine(testDir, "last-error.txt"), e.ToString(), Encoding.UTF8);
-                if (mode.Length == 0) MessageBox.Show("프로그램을 시작하지 못했습니다.\n" + e.Message, "게임 네트워크 모니터");
+                unhandledExceptionSeen = true;
+                DiagnosticsLog.Write("main_exception", "application startup or dispatch failed", e);
+                try { Directory.CreateDirectory(testDir); File.WriteAllText(Path.Combine(testDir, "last-error.txt"), e.ToString(), Encoding.UTF8); }
+                catch (Exception writeError) { DiagnosticsLog.Write("legacy_error_write_failed", "could not write test error file", writeError); }
+                if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + e.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "게임 네트워크 모니터");
                 return 1;
             }
         }

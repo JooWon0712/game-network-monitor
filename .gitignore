@@ -1,8 +1,11 @@
 *.exe
+GameNetworkMonitor.exe~RF*.TMP
 *.pdb
 tests/**/*.txt
 tests/**/*.png
 tests/**/*.csv
+tests/**/*.jsonl
+diagnostics/
 outputs/
 logs/
 .build/

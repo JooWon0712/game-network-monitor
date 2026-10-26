@@ -69,6 +69,7 @@ namespace GameNetworkMonitor
                 metadata.WriteLine("started_utc=" + startedUtc.ToString("o", CultureInfo.InvariantCulture));
                 metadata.WriteLine("started_local=" + startedUtc.ToLocalTime().ToString("o", CultureInfo.InvariantCulture));
                 metadata.WriteLine("state=recording");
+                metadata.WriteLine("state_scope=record_file_writer_only; not application process exit status");
                 metadata.WriteLine("timestamps=ISO-8601; sample cadence is controlled by the monitor window");
                 metadata.WriteLine("privacy=local files only; packet payloads are not stored");
                 metadata.WriteLine("endpoint_scope=selected game; changed cumulative snapshots, not individual packets; observed endpoint retention limit 512");

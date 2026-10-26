@@ -5,6 +5,49 @@ using System.Text;
 
 namespace GameNetworkMonitor
 {
+    // Detached presentation snapshots. Mutating a returned list cannot change the observer.
+    public sealed class AnalysisProbeOverview
+    {
+        public string Target { get; internal set; }
+        public long Total { get; internal set; }
+        public long Successes { get; internal set; }
+        public long Timeouts { get; internal set; }
+        public long Errors { get; internal set; }
+        public long HighResponses { get; internal set; }
+        public double? AverageMs { get; internal set; }
+        public double? MaximumMs { get; internal set; }
+        public double? P95Ms { get; internal set; }
+    }
+
+    public sealed class AnalysisEventView
+    {
+        public DateTime StartUtc { get; internal set; }
+        public DateTime EndUtc { get; internal set; }
+        public string TimeLocal { get; internal set; }
+        public string Title { get; internal set; }
+        public string Detail { get; internal set; }
+        public string Category { get; internal set; }
+        public bool IsNetworkEvidence { get; internal set; }
+    }
+
+    public sealed class AnalysisOverview
+    {
+        public long Samples { get; internal set; }
+        public long GameAvailableSamples { get; internal set; }
+        public long DeliveryDelaySamples { get; internal set; }
+        public double? MaxDeliveryLagMs { get; internal set; }
+        public AnalysisProbeOverview Gateway { get; internal set; }
+        public AnalysisProbeOverview Reference { get; internal set; }
+        // Category counts describe the retained candidate list, never the full session total.
+        public long NetworkCandidateCount { get; internal set; }
+        public long CollectionCandidateCount { get; internal set; }
+        public long GameReceiveCandidateCount { get; internal set; }
+        public long TotalCandidates { get; internal set; }
+        public int RetainedCandidateCount { get; internal set; }
+        public string CandidateScope { get; internal set; }
+        public List<AnalysisEventView> Events { get; internal set; }
+    }
+
     // The observer accepts metadata only. It neither runs probes nor opens a trace.
     public sealed class SessionAnalysis
     {
@@ -42,6 +85,56 @@ namespace GameNetworkMonitor
         private double maximumSnapshotGap;
         private string gameName;
         private int gamePid;
+
+        public AnalysisOverview GetOverview()
+        {
+            lock (gate)
+            {
+                AnalysisOverview result = new AnalysisOverview {
+                    Samples = snapshots, GameAvailableSamples = gameAvailableSnapshots,
+                    DeliveryDelaySamples = deliveryDelaySnapshots,
+                    MaxDeliveryLagMs = deliveryLagObserved ? (double?)maximumDeliveryLag : null,
+                    Gateway = ProbeOverview(gateway), Reference = ProbeOverview(reference),
+                    TotalCandidates = candidateCount, RetainedCandidateCount = candidates.Count,
+                    CandidateScope = "분류별 개수는 최근 보관 후보 " + candidates.Count.ToString(CultureInfo.InvariantCulture) + "개 기준 · 최대 " + MaximumCandidates.ToString(CultureInfo.InvariantCulture) + "개 · 전체 생성 " + candidateCount.ToString(CultureInfo.InvariantCulture) + "개",
+                    Events = new List<AnalysisEventView>()
+                };
+                List<Candidate> ordered = new List<Candidate>(candidates);
+                ordered.Sort(delegate(Candidate left, Candidate right) { return right.Start.CompareTo(left.Start); });
+                foreach (Candidate candidate in ordered)
+                {
+                    bool probeObservation = (candidate.Key.StartsWith("gateway|", StringComparison.Ordinal) || candidate.Key.StartsWith("reference|", StringComparison.Ordinal)) &&
+                        (candidate.Key.EndsWith("|timeout", StringComparison.Ordinal) || candidate.Key.EndsWith("|high-rtt", StringComparison.Ordinal));
+                    bool networkEvidence = probeObservation || candidate.Key == "adapter-counters" || candidate.Key == "adapter-send-rtt";
+                    bool gameReceive = candidate.Key == "game-receive-idle";
+                    string category = networkEvidence ? "연결 검사" : gameReceive ? "게임 수신 관측" : "수집 상태";
+                    if (networkEvidence) result.NetworkCandidateCount++;
+                    else if (gameReceive) result.GameReceiveCandidateCount++;
+                    else result.CollectionCandidateCount++;
+                    DateTime localStart = candidate.Start.ToLocalTime(), localEnd = candidate.End.ToLocalTime();
+                    string range = localStart.ToString("MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                    if (candidate.End != candidate.Start) range += " ~ " + localEnd.ToString(localStart.Date == localEnd.Date ? "HH:mm:ss" : "MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                    result.Events.Add(new AnalysisEventView {
+                        StartUtc = candidate.Start, EndUtc = candidate.End, TimeLocal = range,
+                        Title = candidate.Name, Detail = candidate.Detail, Category = category,
+                        IsNetworkEvidence = networkEvidence
+                    });
+                }
+                return result;
+            }
+        }
+
+        private static AnalysisProbeOverview ProbeOverview(ProbeStatistics statistics)
+        {
+            return new AnalysisProbeOverview {
+                Target = statistics.Target ?? "", Total = statistics.Total,
+                Successes = statistics.Successes, Timeouts = statistics.Timeouts,
+                Errors = statistics.Errors, HighResponses = statistics.HighResponses,
+                AverageMs = statistics.Successes > 0 ? (double?)(statistics.Sum / statistics.Successes) : null,
+                MaximumMs = statistics.Successes > 0 ? (double?)statistics.Maximum : null,
+                P95Ms = statistics.Successes > 0 ? (double?)statistics.Percentile95() : null
+            };
+        }
 
         public void Observe(MonitorSnapshot snapshot)
         {
@@ -491,6 +584,10 @@ namespace GameNetworkMonitor
             DateTime began = new DateTime(2026, 10, 25, 0, 0, 0, DateTimeKind.Utc);
             SessionAnalysis empty = new SessionAnalysis();
             Check(empty.SummaryText().IndexOf("표본이 없습니다", StringComparison.Ordinal) >= 0, "missing data should not be healthy zero");
+            AnalysisOverview emptyOverview = empty.GetOverview();
+            Check(emptyOverview.Samples == 0 && emptyOverview.Gateway.Total == 0 && !emptyOverview.Gateway.AverageMs.HasValue &&
+                !emptyOverview.Gateway.MaximumMs.HasValue && !emptyOverview.Reference.P95Ms.HasValue && !emptyOverview.MaxDeliveryLagMs.HasValue &&
+                emptyOverview.TotalCandidates == 0 && emptyOverview.Events.Count == 0, "overview fabricated healthy measurements before any data");
             SessionAnalysis analysis = new SessionAnalysis();
             for (int i = 0; i < 20; i++)
             {
@@ -499,6 +596,11 @@ namespace GameNetworkMonitor
             }
             Check(analysis.gateway.Successes == 20 && analysis.gateway.Total == 20 && analysis.gateway.Timeouts == 0, "overlapping rolling summaries counted as raw probes");
             Check(analysis.gateway.Percentile95() == 18 && analysis.gateway.Sum / analysis.gateway.Successes == 9.5 && analysis.gateway.Maximum == 19, "exact whole-session RTT statistics");
+            AnalysisOverview wholeSession = analysis.GetOverview();
+            Check(wholeSession.Samples == 20 && wholeSession.Gateway.Total == 20 && wholeSession.Gateway.Successes == 20 &&
+                wholeSession.Gateway.Timeouts == 0 && wholeSession.Gateway.AverageMs == 9.5 && wholeSession.Gateway.MaximumMs == 19 &&
+                wholeSession.Gateway.P95Ms == 18 && !wholeSession.Reference.AverageMs.HasValue,
+                "overview used overlapping rolling summaries or missing reference RTT as zero");
             Check(analysis.gameAvailableSnapshots == 0 && analysis.waitingSnapshots == 20 && analysis.inactiveSnapshots == 0, "first-event waiting confused with inactive collection or zero game traffic");
             Check(analysis.candidates.Count == 1 && analysis.candidates[0].Key == "adapter-unavailable", "missing game samples created game idle or missing adapter treated as zero");
             analysis.ObserveProbe("gateway", new ProbeSample { TimestampUtc = began.AddSeconds(20), Target = "router", Countable = true, TimedOut = true });
@@ -534,8 +636,21 @@ namespace GameNetworkMonitor
             delivery.Observe(delayed);
             Check(HasCandidate(delivery, "trace-delivery-delay") && !HasCandidate(delivery, "game-receive-idle"), "ETW delayed delivery misclassified as receive interruption");
             Check(delivery.deliveryDelaySnapshots == 1 && delivery.maximumDeliveryLag == 3500, "delivery quality metric missing");
+            AnalysisOverview deliveryOverview = delivery.GetOverview();
+            Check(deliveryOverview.NetworkCandidateCount == 0 && deliveryOverview.CollectionCandidateCount == 1 &&
+                deliveryOverview.GameReceiveCandidateCount == 0 && deliveryOverview.GameAvailableSamples == 1 &&
+                deliveryOverview.DeliveryDelaySamples == 1 && deliveryOverview.MaxDeliveryLagMs == 3500 &&
+                deliveryOverview.Events[0].Category == "수집 상태" && !deliveryOverview.Events[0].IsNetworkEvidence,
+                "overview counted collector delivery delay as network evidence");
+            deliveryOverview.Events.Clear();
+            deliveryOverview.Gateway.Target = "mutated display copy";
+            Check(delivery.GetOverview().Events.Count == 1 && delivery.GetOverview().Gateway.Target == "", "overview exposed mutable observer state");
             delivery.Observe(GameFixture(began.AddSeconds(8), 8, 4));
             Check(HasCandidate(delivery, "game-receive-idle"), "actual collector receive silence not represented as a candidate");
+            AnalysisOverview idleOverview = delivery.GetOverview();
+            Check(idleOverview.NetworkCandidateCount == 0 && idleOverview.GameReceiveCandidateCount == 1 &&
+                idleOverview.CollectionCandidateCount == 2 && idleOverview.Events[0].StartUtc >= idleOverview.Events[1].StartUtc,
+                "game receive observation or snapshot gap confused with connection evidence");
             SessionAnalysis oldFormat = new SessionAnalysis();
             oldFormat.Observe(GameFixture(began, 10, null));
             Check(!HasCandidate(oldFormat, "game-receive-idle") && oldFormat.deliveryMissingSnapshots == 1, "missing delivery freshness treated as a real receive gap");
@@ -564,6 +679,19 @@ namespace GameNetworkMonitor
             SessionAnalysis bounded = new SessionAnalysis();
             for (int i = 0; i < 150; i++) bounded.ObserveProbe("reference", new ProbeSample { TimestampUtc = began.AddSeconds(i * 10), Target = "reference", Countable = true, RoundtripMs = 200 });
             Check(bounded.candidates.Count == MaximumCandidates && bounded.latestCandidates.Count <= MaximumCandidates && bounded.candidateCount == 150, "candidate memory is not bounded");
+            AnalysisOverview boundedOverview = bounded.GetOverview();
+            Check(boundedOverview.TotalCandidates == 150 && boundedOverview.RetainedCandidateCount == MaximumCandidates &&
+                boundedOverview.Events.Count == MaximumCandidates && boundedOverview.NetworkCandidateCount == MaximumCandidates &&
+                boundedOverview.CollectionCandidateCount == 0 && boundedOverview.CandidateScope.IndexOf("전체 생성 150", StringComparison.Ordinal) >= 0 &&
+                boundedOverview.Events[0].Category == "연결 검사" && boundedOverview.Events[0].IsNetworkEvidence,
+                "overview confused full generated totals with retained category counts");
+            SessionAnalysis probeError = new SessionAnalysis();
+            probeError.ObserveProbe("gateway", new ProbeSample { TimestampUtc = began, Target = "bad-target", Countable = false, Status = "fixture error" });
+            probeError.ObserveProbe("gateway", new ProbeSample { TimestampUtc = began.AddSeconds(1), Target = "bad-target", Countable = false, Status = "fixture error" });
+            AnalysisOverview errorOverview = probeError.GetOverview();
+            Check(errorOverview.Gateway.Total == 2 && errorOverview.Gateway.Errors == 2 && !errorOverview.Gateway.P95Ms.HasValue &&
+                errorOverview.NetworkCandidateCount == 0 && errorOverview.CollectionCandidateCount == 1 && !errorOverview.Events[0].IsNetworkEvidence,
+                "probe measurement errors presented as timeout or network outage");
             Check(bounded.SummaryText().IndexOf("고정 기준", StringComparison.Ordinal) >= 0 && bounded.SummaryText().IndexOf("확정하지 않습니다", StringComparison.Ordinal) >= 0, "rules or evidence boundary omitted");
         }
 
