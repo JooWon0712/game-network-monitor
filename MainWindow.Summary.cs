@@ -53,12 +53,12 @@ namespace PcInternetMonitor
         {
             UpdateTrayState();
             Color color = fault ? ErrorColor : running ? AccentColor : MutedColor;
-            recordingTitle.Text = fault ? "[!] 오류로 검사 중지" : running ? "[*] 검사 · 기록 중" : "[-] 검사 중지"; recordingTitle.Foreground = Brush(color); recordingBanner.BorderBrush = Brush(color);
-            recordingDetail.Text = running ? "진행 " + (DateTime.UtcNow - beganUtc).ToString(@"hh\:mm\:ss") + " · 기록 " + sampleCount.ToString("N0") + "개 · 마지막 관측 " + (lastSampleUtc == DateTime.MinValue ? "대기" : lastSampleUtc.ToLocalTime().ToString("HH:mm:ss")) : stopReason;
+            recordingTitle.Text = !running && clockStopUtc != DateTime.MinValue ? "[!] 시각 변경으로 검사 중지" : fault ? "[!] 오류로 검사 중지" : running ? "[*] 검사 · 기록 중" : "[-] 검사 중지"; recordingTitle.Foreground = Brush(color); recordingBanner.BorderBrush = Brush(color);
+            recordingDetail.Text = running ? "진행 " + sessionElapsed.Elapsed.ToString(@"hh\:mm\:ss") + " · 기록 " + sampleCount.ToString("N0") + "개 · 마지막 관측 " + (lastSampleUtc == DateTime.MinValue ? "대기" : lastSampleUtc.ToLocalTime().ToString("HH:mm:ss")) : stopReason;
             if (notice.Length > 0) recordingDetail.Text += "\n" + notice;
             if (!String.IsNullOrEmpty(DiagnosticsLog.ErrorMessage)) recordingDetail.Text += "\n진단 저장 오류: " + DiagnosticsLog.ErrorMessage;
             recordingDetail.ToolTip = recordingDetail.Text;
-            Title = (fault ? "기록 오류" : running ? "검사 중" : "검사 중지") + " | PC 인터넷 모니터 " + AppVersion;
+            Title = (!running && clockStopUtc != DateTime.MinValue ? "시각 변경으로 중지" : fault ? "기록 오류" : running ? "검사 중" : "검사 중지") + " | PC 인터넷 모니터 " + AppVersion;
             ShowProbe("gateway", latest == null ? null : latest.Gateway); ShowProbe("reference", latest == null ? null : latest.Reference);
             ShowInternet("dns", latestInternet == null ? null : latestInternet.Dns); ShowInternet("https", latestInternet == null ? null : latestInternet.Https);
             bool link = latest != null && latest.AdapterCountersAvailable; string usage = latest != null && latest.AdapterRatesAvailable ? " · 받기 " + Rate(latest.AdapterReceivedBytesPerSecond) + " / 보내기 " + Rate(latest.AdapterSentBytesPerSecond) : "";
@@ -67,13 +67,13 @@ namespace PcInternetMonitor
         }
         private void ShowProbe(string key, ProbeSummary probe)
         {
-            bool fresh = running && probe != null && !probe.Stale; bool success = fresh && probe.CurrentMs.HasValue && !probe.CurrentError && !probe.CurrentTimedOut;
-            values[key].Text = success ? Ms(probe.CurrentMs.Value) : !running || probe == null ? "—" : probe.CurrentError ? "검사 오류" : probe.CurrentTimedOut ? "응답 없음" : probe.Stale ? "최근 값 없음" : String.IsNullOrEmpty(probe.Target) ? "대상 없음" : "검사 대기";
-            bool attention = running && probe != null && (probe.CurrentError || probe.CurrentTimedOut || (success && probe.CurrentMs.Value >= (key == "gateway" ? 20 : 150)));
+            bool fresh = running && probe != null && !probe.Stale; bool success = fresh && probe.CurrentMs.HasValue && !probe.CurrentError && !probe.CurrentNetworkFailure && !probe.CurrentTimedOut;
+            values[key].Text = success ? Ms(probe.CurrentMs.Value) : !running || probe == null ? "—" : probe.CurrentNetworkFailure ? "응답/경로 실패" : probe.CurrentError ? "검사 오류" : probe.CurrentTimedOut ? "응답 없음" : probe.Stale ? "최근 값 없음" : String.IsNullOrEmpty(probe.Target) ? "대상 없음" : "검사 대기";
+            bool attention = running && probe != null && (probe.CurrentError || probe.CurrentNetworkFailure || probe.CurrentTimedOut || (success && probe.CurrentMs.Value >= (key == "gateway" ? 20 : 150)));
             values[key].Foreground = Brush(attention ? AmberColor : success ? AccentColor : MutedColor);
-            values[key + "Detail"].Text = probe == null || probe.Sent == 0 ? !running ? "검사 중지" : "ICMP · 유효한 검사 대기" : "최근 60초 무응답 " + (100.0 * probe.Missing / probe.Sent).ToString("N1") + "%\n" + probe.Missing + " / " + probe.Sent + "회 · 오류 " + probe.Errors;
+            values[key + "Detail"].Text = !running ? "검사 중지" : probe == null ? "ICMP · 검사 대기" : (probe.Sent == 0 ? "무응답률 표본 없음" : "최근 60초 무응답 " + (100.0 * probe.Missing / probe.Sent).ToString("N1") + "% · " + probe.Missing + "/" + probe.Sent + "회") + "\n경로 실패 " + probe.NetworkFailures + "회 · 검사 오류 " + probe.Errors + "회";
             values[key + "Target"].Text = probe == null ? key == "reference" ? DefaultReferenceTarget : "선택 연결의 기본 게이트웨이" : probe.Target;
-            values[key].ToolTip = (probe == null ? "" : probe.Status + "\n") + "ICMP 응답 검사이며 전체 데이터 패킷 유실률이 아닙니다. 무응답률은 최근 60초의 시간 초과 ÷ (응답+시간 초과), 검사 오류는 제외합니다.\n" + RouteNote;
+            values[key].ToolTip = (probe == null ? "" : probe.Status + "\n") + "ICMP 응답 검사이며 전체 데이터 패킷 유실률이 아닙니다. 무응답률은 최근 60초의 시간 초과 ÷ (응답+시간 초과), 경로 실패·검사 오류는 분모에서 제외하고 따로 표시합니다.\n" + RouteNote;
         }
         private void ShowInternet(string key, InternetCheckSample sample)
         {

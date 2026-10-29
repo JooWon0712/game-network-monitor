@@ -8,9 +8,19 @@ using System.Text;
 
 namespace PcInternetMonitor
 {
-    public sealed class MonitorController : IDisposable
+    public sealed partial class MonitorController : IDisposable
     {
         private readonly object gate = new object();
+        private readonly object gatewayControlGate = new object();
+        private readonly Func<string, AdapterInfo> gatewayAdapterProvider;
+        private readonly Action<string> startGatewayProbe;
+        private readonly Action stopGatewayProbe;
+        private readonly Func<long> gatewayClock;
+        private string selectedAdapterId = "", currentGatewayTarget = "";
+        private bool followAdapterGateway, gatewayRefreshInProgress, gatewayLookupFailed;
+        private long gatewayEpoch, gatewayRefreshTick;
+        private DateTime gatewayEpochStartedUtc;
+        private Action<ProbeSample> gatewaySampleHandler;
         private readonly KernelNetworkMonitor trace = new KernelNetworkMonitor();
         private readonly TcpRttMonitor tcpRtt = new TcpRttMonitor();
         private readonly ProbeRunner gatewayProbe = new ProbeRunner();
@@ -29,12 +39,141 @@ namespace PcInternetMonitor
         private bool gameRequested, processesRequested;
         private long captureGeneration;
         public event Action<string, ProbeSample> ProbeSampled;
+        public event Action<string, string> GatewayTargetChanged;
 
-        public MonitorController()
+        public MonitorController() : this(null, null, null, null) { }
+
+        internal MonitorController(Func<string, AdapterInfo> gatewayAdapterProvider, Action<string> gatewayStart,
+            Action gatewayStop, Func<long> gatewayClock)
         {
+            this.gatewayAdapterProvider = gatewayAdapterProvider ?? new Func<string, AdapterInfo>(FindGatewayAdapter);
+            startGatewayProbe = gatewayStart ?? new Action<string>(gatewayProbe.Start);
+            stopGatewayProbe = gatewayStop ?? new Action(gatewayProbe.Stop);
+            this.gatewayClock = gatewayClock ?? new Func<long>(Stopwatch.GetTimestamp);
             trace.EventReceived += AcceptTraffic;
-            gatewayProbe.Sampled += delegate(ProbeSample s) { AcceptProbe("gateway", s, gateway); };
             referenceProbe.Sampled += delegate(ProbeSample s) { AcceptProbe("reference", s, reference); };
+        }
+
+        private static AdapterInfo FindGatewayAdapter(string adapterId)
+        {
+            // Missing entries can also mean an OS enumeration/property query failed.
+            // Only a successfully returned, matching adapter can confirm an empty gateway.
+            return AdapterCatalog.GetAdapters().FirstOrDefault(delegate(AdapterInfo item) {
+                return String.Equals(item.Id, adapterId, StringComparison.OrdinalIgnoreCase);
+            });
+        }
+
+        private void ResetGatewayLocked(string target)
+        {
+            if (gatewaySampleHandler != null) gatewayProbe.Sampled -= gatewaySampleHandler;
+            gatewaySampleHandler = null;
+            currentGatewayTarget = target ?? "";
+            gateway.Clear(currentGatewayTarget);
+            gatewayEpoch++;
+            gatewayEpochStartedUtc = DateTime.UtcNow;
+            if (currentGatewayTarget.Length == 0) return;
+            long session = captureGeneration, epoch = gatewayEpoch;
+            string expectedTarget = currentGatewayTarget;
+            gatewaySampleHandler = delegate(ProbeSample sample) { AcceptGatewayProbe(sample, session, epoch, expectedTarget); };
+            gatewayProbe.Sampled += gatewaySampleHandler;
+        }
+
+        private void AcceptGatewayProbe(ProbeSample sample, long session, long epoch, string expectedTarget)
+        {
+            lock (gate)
+            {
+                if (!running || sample == null || session != captureGeneration || epoch != gatewayEpoch ||
+                    sample.TimestampUtc < gatewayEpochStartedUtc ||
+                    !String.Equals(expectedTarget, currentGatewayTarget, StringComparison.Ordinal) ||
+                    !String.Equals(sample.Target, expectedTarget, StringComparison.Ordinal)) return;
+                AcceptProbe("gateway", sample, gateway);
+            }
+        }
+
+        private void StopGatewayProbe(bool stopSession)
+        {
+            // Timer start/stop is serialized separately from sample acceptance. In
+            // particular, a refresh that finished after Stop cannot arm the timer again.
+            lock (gatewayControlGate)
+            {
+                lock (gate)
+                {
+                    if (stopSession) running = false;
+                    followAdapterGateway = false;
+                    gatewayEpoch++;
+                    if (gatewaySampleHandler != null) gatewayProbe.Sampled -= gatewaySampleHandler;
+                    gatewaySampleHandler = null;
+                }
+                stopGatewayProbe();
+            }
+        }
+
+        private void RefreshGatewayTarget()
+        {
+            long session;
+            string adapterId;
+            lock (gate)
+            {
+                if (!running || disposed || !followAdapterGateway || gatewayRefreshInProgress) return;
+                long now = gatewayClock(), elapsed = now - gatewayRefreshTick;
+                if (elapsed >= 0 && elapsed < 2 * Stopwatch.Frequency) return;
+                gatewayRefreshTick = now;
+                gatewayRefreshInProgress = true;
+                session = captureGeneration; adapterId = selectedAdapterId;
+            }
+            try
+            {
+                string target;
+                try
+                {
+                    // OS adapter enumeration can block and must not hold the gate
+                    // used by probe/ETW callbacks or Stop.
+                    AdapterInfo current = gatewayAdapterProvider(adapterId);
+                    if (current == null || !String.Equals(current.Id, adapterId, StringComparison.OrdinalIgnoreCase)) return;
+                    target = String.IsNullOrWhiteSpace(current.Gateway) ? "" : ProbeRunner.NormalizeTarget(current.Gateway);
+                }
+                catch (Exception error)
+                {
+                    bool report = false;
+                    lock (gate)
+                    {
+                        if (session == captureGeneration && running && !gatewayLookupFailed) { gatewayLookupFailed = true; report = true; }
+                    }
+                    if (report) DiagnosticsLog.Write("gateway_refresh_lookup_failed", "selected adapter gateway kept unchanged", error);
+                    return;
+                }
+                lock (gatewayControlGate)
+                {
+                    string previousTarget;
+                    long epoch;
+                    lock (gate)
+                    {
+                        if (!running || disposed || !followAdapterGateway || session != captureGeneration ||
+                            !String.Equals(adapterId, selectedAdapterId, StringComparison.OrdinalIgnoreCase)) return;
+                        gatewayLookupFailed = false;
+                        if (String.Equals(target, currentGatewayTarget, StringComparison.Ordinal)) return;
+                        previousTarget = currentGatewayTarget;
+                        ResetGatewayLocked(target);
+                        epoch = gatewayEpoch;
+                    }
+                    stopGatewayProbe();
+                    // A subscriber can end the old history before any reply from the
+                    // replacement target is produced. Never invoke it under gate.
+                    Action<string, string> handler = GatewayTargetChanged;
+                    if (handler != null)
+                        foreach (Action<string, string> subscriber in handler.GetInvocationList())
+                            try { subscriber(previousTarget, target); }
+                            catch (Exception error) { DiagnosticsLog.Write("gateway_target_changed_handler_failed", "target transition subscriber", error); }
+                    bool start;
+                    lock (gate) start = running && !disposed && followAdapterGateway && session == captureGeneration &&
+                        epoch == gatewayEpoch && String.Equals(target, currentGatewayTarget, StringComparison.Ordinal);
+                    if (start && target.Length != 0) startGatewayProbe(target);
+                }
+            }
+            finally
+            {
+                lock (gate) if (session == captureGeneration) gatewayRefreshInProgress = false;
+            }
         }
 
         private void AcceptTraffic(TrafficEvent e)
@@ -56,7 +195,7 @@ namespace PcInternetMonitor
             }
         }
 
-        public void Start(int processId, string adapterId, string gatewayTarget, string referenceTarget, bool collectGame, bool collectProcesses = false)
+        public void Start(int processId, string adapterId, string gatewayTarget, string referenceTarget, bool collectGame, bool collectProcesses = false, bool followAdapterGateway = false)
         {
             Stop();
             if (disposed) throw new ObjectDisposedException("MonitorController");
@@ -76,18 +215,26 @@ namespace PcInternetMonitor
                 }
                 if (collectGame && started == DateTime.MinValue) throw new ArgumentException("게임 프로세스의 시작 시각을 확인할 수 없습니다. 관리자 권한을 확인하거나 게임을 ‘선택 안 함’으로 바꿔 PC·공유기·외부 ICMP를 측정하세요.");
             }
-            lock (gate)
+            lock (gatewayControlGate)
             {
-                pid = processId; processName = name; processStarted = started; processEnded = false;
-                captureGeneration++;
-                gameRequested = collectGame && processId > 0; processesRequested = collectProcesses;
-                traffic.Clear(); gateway.Clear(gatewayTarget); reference.Clear(referenceTarget);
-                adapter = new AdapterReader(adapterId);
-                baseline = previous = adapter.Read();
-                adapterTotals.Clear(); adapterTotals.Update(baseline);
-                began = DateTime.UtcNow; running = true;
+                lock (gate)
+                {
+                    pid = processId; processName = name; processStarted = started; processEnded = false;
+                    captureGeneration++;
+                    gameRequested = collectGame && processId > 0; processesRequested = collectProcesses;
+                    traffic.Clear(); reference.Clear(referenceTarget);
+                    adapter = new AdapterReader(adapterId);
+                    baseline = previous = adapter.Read();
+                    adapterTotals.Clear(); adapterTotals.Update(baseline);
+                    began = DateTime.UtcNow; running = true;
+                    selectedAdapterId = adapterId ?? "";
+                    this.followAdapterGateway = followAdapterGateway && selectedAdapterId.Length != 0;
+                    gatewayRefreshInProgress = gatewayLookupFailed = false;
+                    gatewayRefreshTick = gatewayClock();
+                    ResetGatewayLocked(gatewayTarget);
+                }
+                if (!String.IsNullOrEmpty(gatewayTarget)) startGatewayProbe(gatewayTarget);
             }
-            if (!String.IsNullOrEmpty(gatewayTarget)) gatewayProbe.Start(gatewayTarget);
             if (!String.IsNullOrEmpty(referenceTarget)) referenceProbe.Start(referenceTarget);
             if (gameRequested) tcpRtt.Start(processId, started);
             if (gameRequested || collectProcesses) trace.Start(gameRequested ? processId : 0, collectProcesses, captureGeneration);
@@ -95,6 +242,7 @@ namespace PcInternetMonitor
 
         public MonitorSnapshot Snapshot()
         {
+            RefreshGatewayTarget();
             return SnapshotCore(null);
         }
 
@@ -184,8 +332,8 @@ namespace PcInternetMonitor
 
         public void Stop()
         {
-            lock (gate) running = false;
-            gatewayProbe.Stop(); referenceProbe.Stop(); trace.Stop(); tcpRtt.Stop();
+            StopGatewayProbe(true);
+            referenceProbe.Stop(); trace.Stop(); tcpRtt.Stop();
         }
 
         public MonitorSnapshot StopAndSnapshot(int drainTimeoutMilliseconds = 2500)
@@ -197,7 +345,7 @@ namespace PcInternetMonitor
             TcpRttSnapshot lastTcp = null;
             try
             {
-                gatewayProbe.Stop(); referenceProbe.Stop();
+                StopGatewayProbe(false); referenceProbe.Stop();
                 // Keep acceptance enabled while the ETW consumer drains. Never wait under gate.
                 if (needsTrace) final = trace.StopAndCapture(drainTimeoutMilliseconds);
                 else { trace.Stop(); final = new TraceStopResult { Drained = true, Health = trace.GetHealth(), Status = "ETW 미요청 · 최종 PC/ICMP 표본 반영" }; }
@@ -308,8 +456,8 @@ namespace PcInternetMonitor
             foreach (ProbeSample sample in samples)
             {
                 latest = sample;
-                if (sample.Countable) { s.Sent++; if (sample.TimedOut) s.Missing++; } else s.Errors++;
-                if (sample.RoundtripMs.HasValue)
+                if (sample.Countable) { s.Sent++; if (sample.TimedOut) s.Missing++; } else if (sample.NetworkFailure) s.NetworkFailures++; else s.Errors++;
+                if (sample.RoundtripMs.HasValue && !sample.NetworkFailure)
                 {
                     sum += sample.RoundtripMs.Value; count++;
                     if (last.HasValue) { diffs += Math.Abs(sample.RoundtripMs.Value - last.Value); pairs++; }
@@ -324,10 +472,11 @@ namespace PcInternetMonitor
                 s.LastSampleUtc = latest.TimestampUtc;
                 double age = (now - latest.TimestampUtc).TotalSeconds;
                 s.Stale = age < 0 || age >= 3;
-                s.CurrentError = !s.Stale && (!latest.Countable || (!latest.TimedOut && !latest.RoundtripMs.HasValue));
+                s.CurrentError = !s.Stale && !latest.NetworkFailure && (!latest.Countable || (!latest.TimedOut && !latest.RoundtripMs.HasValue));
+                s.CurrentNetworkFailure = !s.Stale && latest.NetworkFailure;
                 s.CurrentTimedOut = !s.Stale && latest.Countable && latest.TimedOut;
                 s.Status = latest.Status;
-                if (!s.Stale) s.CurrentMs = latest.RoundtripMs;
+                if (!s.Stale && !latest.NetworkFailure) s.CurrentMs = latest.RoundtripMs;
             }
             return s;
         }

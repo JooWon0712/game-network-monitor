@@ -83,7 +83,7 @@ namespace PcInternetMonitor
                     Value(header, mismatch, "remote") == "" && Value(header, mismatch, "connection_key") == "" &&
                     Value(header, mismatch, "smoothed_rtt_ms") == "", "another process's connection metadata leaked into the selected PID log");
                 string metadata = File.ReadAllText(Path.Combine(directory, "session.txt"), Encoding.UTF8);
-                Check(metadata.Contains("format_version=5") && metadata.Contains("tcp_rtt_rows_written=5") && metadata.Contains("state=completed"),
+                Check(metadata.Contains("format_version=6") && metadata.Contains("tcp_rtt_rows_written=5") && metadata.Contains("state=completed"),
                     "RTT writer completion metadata is incomplete");
                 Check(File.ReadAllLines(Path.Combine(directory, "samples.csv"), Encoding.UTF8).Length == 7,
                     "cached RTT deduplication removed ordinary monitor samples");

@@ -80,6 +80,8 @@ namespace PcInternetMonitor
         public double? RoundtripMs;
         public bool TimedOut;
         public bool Countable;
+        // Independent of the timeout-ratio denominator: a known route/ICMP failure.
+        public bool NetworkFailure;
     }
 
     public sealed class EndpointRow
@@ -106,8 +108,10 @@ namespace PcInternetMonitor
         public int Sent;
         public int Missing;
         public int Errors;
+        public int NetworkFailures;
         public DateTime? LastSampleUtc;
         public bool CurrentError;
+        public bool CurrentNetworkFailure;
         public bool CurrentTimedOut;
         public bool Stale;
     }

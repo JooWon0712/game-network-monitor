@@ -350,16 +350,50 @@ namespace PcInternetMonitor
                 sample.TimedOut = true;
                 sample.Countable = true;
             }
+            else if (IsNetworkFailure(status))
+            {
+                // Failure meaning is independent of Countable. The timeout ratio
+                // remains timeouts / (echo replies + timeouts), excluding these results.
+                sample.NetworkFailure = true;
+                sample.Status = "ICMP 응답/경로 실패 · " + status.ToString() + " (무응답률에서 제외)";
+            }
             else
             {
-                sample.Status = "ICMP 오류 · " + status.ToString() + " (응답 누락률에서 제외)";
+                sample.Status = "ICMP 검사 오류 · " + status.ToString() + " (무응답률에서 제외)";
             }
             return sample;
+        }
+
+        private static bool IsNetworkFailure(IPStatus status)
+        {
+            // Known reachability/routing/ICMP feedback is a connection result,
+            // unlike local resource, malformed-request or unknown status failures.
+            // DestinationProhibited shares DestinationProtocolUnreachable's value.
+            switch (status)
+            {
+                case IPStatus.DestinationNetworkUnreachable:
+                case IPStatus.DestinationHostUnreachable:
+                case IPStatus.DestinationProtocolUnreachable:
+                case IPStatus.DestinationPortUnreachable:
+                case IPStatus.DestinationUnreachable:
+                case IPStatus.BadRoute:
+                case IPStatus.PacketTooBig:
+                case IPStatus.TtlExpired:
+                case IPStatus.TtlReassemblyTimeExceeded:
+                case IPStatus.TimeExceeded:
+                case IPStatus.ParameterProblem:
+                case IPStatus.SourceQuench:
+                case IPStatus.DestinationScopeMismatch:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private static ProbeSample FromException(string destination, Exception error)
         {
             string reason = "ICMP 측정 오류";
+            bool networkFailure = false;
             for (Exception current = error; current != null; current = current.InnerException)
             {
                 SocketException socket = current as SocketException;
@@ -367,19 +401,20 @@ namespace PcInternetMonitor
                 if (current is UnauthorizedAccessException || current is SecurityException ||
                     (socket != null && socket.SocketErrorCode == SocketError.AccessDenied) ||
                     (native != null && (native.NativeErrorCode == 5 || native.NativeErrorCode == 1314 || native.NativeErrorCode == 10013)))
-                { reason = "ICMP 접근 권한·정책 오류"; break; }
+                { reason = "ICMP 접근 권한·정책 오류"; networkFailure = false; break; }
                 if (socket != null && (socket.SocketErrorCode == SocketError.HostNotFound ||
                     socket.SocketErrorCode == SocketError.NoData || socket.SocketErrorCode == SocketError.TryAgain))
-                    reason = "대상 이름 확인 실패 (DNS)";
+                { reason = "대상 이름 확인 실패 (DNS)"; networkFailure = false; }
                 else if (socket != null && (socket.SocketErrorCode == SocketError.NetworkUnreachable || socket.SocketErrorCode == SocketError.HostUnreachable))
-                    reason = "네트워크·대상 도달 불가";
-                else if (current is OperationCanceledException) reason = "ICMP 측정 취소";
+                { reason = "네트워크·대상 도달 불가"; networkFailure = true; }
+                else if (current is OperationCanceledException) { reason = "ICMP 측정 취소"; networkFailure = false; }
             }
             return new ProbeSample
             {
                 TimestampUtc = DateTime.UtcNow,
                 Target = destination,
-                Status = reason + " (응답 누락률에서 제외)",
+                Status = reason + " (무응답률에서 제외)",
+                NetworkFailure = networkFailure,
                 Countable = false,
                 TimedOut = false
             };
@@ -453,13 +488,34 @@ namespace PcInternetMonitor
             ProbeSample success = FromReply("target", IPStatus.Success, 7);
             ProbeSample timeout = FromReply("target", IPStatus.TimedOut, 0);
             ProbeSample unreachable = FromReply("target", IPStatus.DestinationHostUnreachable, 0);
-            Assert(success.Countable && !success.TimedOut && success.RoundtripMs == 7, "성공 분류 실패");
-            Assert(timeout.Countable && timeout.TimedOut && timeout.RoundtripMs == null, "시간 초과 분류 실패");
-            Assert(!unreachable.Countable && !unreachable.TimedOut, "도달 불가를 손실로 분류");
+            Assert(success.Countable && !success.TimedOut && !success.NetworkFailure && success.RoundtripMs == 7, "성공 분류 실패");
+            Assert(timeout.Countable && timeout.TimedOut && !timeout.NetworkFailure && timeout.RoundtripMs == null, "시간 초과 분류 실패");
+            Assert(!unreachable.Countable && !unreachable.TimedOut && unreachable.NetworkFailure && !unreachable.RoundtripMs.HasValue,
+                "도달 불가의 실패 의미 또는 무응답 분모 제외가 사라짐");
+            foreach (IPStatus status in new IPStatus[] { IPStatus.DestinationNetworkUnreachable, IPStatus.DestinationHostUnreachable,
+                IPStatus.DestinationProtocolUnreachable, IPStatus.DestinationPortUnreachable, IPStatus.DestinationUnreachable,
+                IPStatus.BadRoute, IPStatus.PacketTooBig, IPStatus.TtlExpired, IPStatus.TtlReassemblyTimeExceeded,
+                IPStatus.TimeExceeded, IPStatus.ParameterProblem, IPStatus.SourceQuench, IPStatus.DestinationScopeMismatch })
+            {
+                ProbeSample failure = FromReply("target", status, 9);
+                Assert(failure.NetworkFailure && !failure.Countable && !failure.TimedOut && !failure.RoundtripMs.HasValue,
+                    "경로/ICMP 실패를 검사 오류 또는 유효 응답으로 분류: " + status);
+            }
+            foreach (IPStatus status in new IPStatus[] { IPStatus.NoResources, IPStatus.BadOption, IPStatus.HardwareError,
+                IPStatus.BadDestination, IPStatus.BadHeader, IPStatus.UnrecognizedNextHeader, IPStatus.IcmpError, IPStatus.Unknown, (IPStatus)12345 })
+            {
+                ProbeSample failure = FromReply("target", status, 9);
+                Assert(!failure.NetworkFailure && !failure.Countable && !failure.TimedOut && !failure.RoundtripMs.HasValue,
+                    "로컬/미확인 상태를 실제 응답 실패로 확정: " + status);
+            }
             ProbeSample dns = FromException("target", new PingException("test", new SocketException((int)SocketError.HostNotFound)));
             ProbeSample denied = FromException("target", new PingException("test", new Win32Exception(5)));
-            Assert(!dns.Countable && dns.Status.IndexOf("DNS", StringComparison.Ordinal) >= 0, "DNS 오류 분류 실패");
-            Assert(!denied.Countable && denied.Status.IndexOf("권한", StringComparison.Ordinal) >= 0, "권한 오류 분류 실패");
+            Assert(!dns.Countable && !dns.NetworkFailure && dns.Status.IndexOf("DNS", StringComparison.Ordinal) >= 0, "DNS 오류 분류 실패");
+            Assert(!denied.Countable && !denied.NetworkFailure && denied.Status.IndexOf("권한", StringComparison.Ordinal) >= 0, "권한 오류 분류 실패");
+            ProbeSample noRoute = FromException("target", new PingException("fixture", new SocketException((int)SocketError.NetworkUnreachable)));
+            ProbeSample noHost = FromException("target", new PingException("fixture", new SocketException((int)SocketError.HostUnreachable)));
+            Assert(noRoute.NetworkFailure && noHost.NetworkFailure && !noRoute.Countable && !noHost.Countable,
+                "OS 경로/호스트 도달 불가 예외 분류 실패");
             using (ProbeRunner runner = new ProbeRunner())
             {
                 int delivered = 0;

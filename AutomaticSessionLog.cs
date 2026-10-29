@@ -14,7 +14,7 @@ namespace PcInternetMonitor
         private sealed class PendingRow { public int Kind; public string Text; public int Count; }
         private const int MaximumQueuedRows = 4096;
         private const int MaximumQueuedCharacters = 16 * 1024 * 1024;
-        private const string ProbeHeader = "timestamp_utc,timestamp_local,kind,target,status,rtt_ms,countable,timed_out";
+        private const string ProbeHeader = "timestamp_utc,timestamp_local,kind,target,status,rtt_ms,countable,timed_out,network_failure";
         internal const string TcpRttHeader = "snapshot_utc,rtt_snapshot_utc,pid,process,requested,state,status,available,permission_denied,stale,partial,connections_found,connections_tracked,connections_measured,connections_skipped,minimum_smoothed_rtt_ms,maximum_smoothed_rtt_ms,native_error_code,error_stage,connection_key,address_family,local,remote,connection_created_timestamp,connection_available,collection_enabled,collection_owned,last_sample_utc,smoothed_rtt_ms,sample_rtt_ms,rtt_samples_total,rtt_samples_delta,connection_error_code,connection_status,actual_game_ping_support,game_packet_loss_support";
         internal const string InternetCheckHeader = "started_utc,completed_utc,completed_local,kind,target,state,status,success,timed_out,cancelled,duration_ms,http_status,error";
         internal const string ConnectivityIncidentHeader = "id,version,kind,target,category,scope,state,first_failed_check_utc,last_observed_utc,recovered_utc,observation_closed_utc,duration_seconds,failed_checks,summary,end_reason";
@@ -78,7 +78,7 @@ namespace PcInternetMonitor
                 tcpRtt.WriteLine(TcpRttHeader);
                 internetChecks.WriteLine(InternetCheckHeader);
                 connectivityIncidents.WriteLine(ConnectivityIncidentHeader);
-                metadata.WriteLine("format_version=5");
+                metadata.WriteLine("format_version=6");
                 metadata.WriteLine("started_utc=" + startedUtc.ToString("o", CultureInfo.InvariantCulture));
                 metadata.WriteLine("started_local=" + startedUtc.ToLocalTime().ToString("o", CultureInfo.InvariantCulture));
                 metadata.WriteLine("state=recording");
@@ -305,7 +305,7 @@ namespace PcInternetMonitor
                 sample.TimestampUtc.ToLocalTime().ToString("o", CultureInfo.InvariantCulture),
                 SessionLog.Csv(kind), SessionLog.Csv(sample.Target), SessionLog.Csv(sample.Status),
                 sample.RoundtripMs.HasValue ? sample.RoundtripMs.Value.ToString("0.###", CultureInfo.InvariantCulture) : "",
-                sample.Countable ? "true" : "false", sample.TimedOut ? "true" : "false"
+                sample.Countable ? "true" : "false", sample.TimedOut ? "true" : "false", sample.NetworkFailure ? "true" : "false"
             }));
         }
 
@@ -473,7 +473,7 @@ namespace PcInternetMonitor
                 Check(bytes.Length > 3 && bytes[0] == 239 && bytes[1] == 187 && bytes[2] == 191, "UTF-8 BOM");
                 string firstDir = Path.GetDirectoryName(firstSamples);
                 string[] probeRows = File.ReadAllLines(Path.Combine(firstDir, "probes.csv"), Encoding.UTF8);
-                Check(probeRows.Length == 3 && probeRows[1].Contains(",7.5,true,false") && probeRows[2].EndsWith(",,true,true", StringComparison.Ordinal), "raw probe details");
+                Check(probeRows.Length == 3 && probeRows[0] == ProbeHeader && probeRows[1].EndsWith(",7.5,true,false,false", StringComparison.Ordinal) && probeRows[2].EndsWith(",,true,true,false", StringComparison.Ordinal), "raw probe details");
                 Check(File.ReadAllText(Path.Combine(firstDir, "marks.csv"), Encoding.UTF8).Contains("\"manual, \"\"mark\"\"\""), "mark quoting");
                 Check(File.ReadAllText(Path.Combine(firstDir, "session.txt"), Encoding.UTF8).Contains("state=completed"), "completion metadata");
                 string previousContent = File.ReadAllText(firstSamples, Encoding.UTF8);

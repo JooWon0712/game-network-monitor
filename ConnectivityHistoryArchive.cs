@@ -225,7 +225,10 @@ namespace PcInternetMonitor
             if (value.Length == 0 || !(value.EndsWith("Z", StringComparison.Ordinal) || value.Length >= 6 && (value[value.Length - 6] == '+' || value[value.Length - 6] == '-')) ||
                 !DateTime.TryParseExact(value, "o", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) return false;
             utc = parsed.ToUniversalTime();
-            return utc > DateTime.MinValue && utc <= DateTime.UtcNow.AddMinutes(1);
+            // A persisted session may belong to an earlier wall-clock epoch.
+            // After a clock rollback its valid observations can be in the future
+            // relative to this process. Parse() validates each row's chronology.
+            return utc > DateTime.MinValue;
         }
         private static DateTime? NullableDate(string value) { DateTime parsed; return Date(value, out parsed) ? parsed : (DateTime?)null; }
 

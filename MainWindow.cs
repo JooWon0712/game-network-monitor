@@ -54,7 +54,7 @@ namespace PcInternetMonitor
             InstallTerminalStyles(); InstallPickerStyles(); Content = BuildWindow(); RefreshSources(selection == null ? null : selection.AdapterId);
             if (selection != null) { gatewayOverride = selection.Gateway; referenceOverride = selection.UseReference ? selection.Reference : null; }
             refreshButton.Click += delegate { RefreshSources(null); }; startButton.Click += delegate { StartSession(); }; stopButton.Click += delegate { StopSession("사용자 중지", null); }; logFolderButton.Click += delegate { OpenLogFolder(); };
-            controller.ProbeSampled += RecordProbe; internet.Sampled += RecordInternetCheck; history.Changed += RecordIncident;
+            controller.GatewayTargetChanged += RecordGatewayTargetChanged; controller.ProbeSampled += RecordProbe; internet.Sampled += RecordInternetCheck; history.Changed += RecordIncident;
             timer.Interval = TimeSpan.FromSeconds(1); timer.Tick += delegate { Poll(); };
             Closing += HandleWindowClosing;
             Closed += delegate { try { DisposeMonitor(); } finally { DisposeTray(); DiagnosticsLog.Write("window_closed", "session=" + lastDirectory); } };
@@ -84,11 +84,11 @@ namespace PcInternetMonitor
                 AdapterInfo current = AdapterCatalog.GetAdapters().FirstOrDefault(x => x.Id == selected.Id) ?? selected;
                 string gateway = !String.IsNullOrEmpty(gatewayOverride) ? gatewayOverride : current.Gateway;
                 string reference = !String.IsNullOrEmpty(referenceOverride) ? referenceOverride : DefaultReferenceTarget;
-                lock (recordingGate) { beganUtc = DateTime.UtcNow; lastSampleUtc = DateTime.MinValue; sampleCount = 0; fault = false; notice = ""; latest = null; latestInternet = null; internetSummary = new InternetSessionSummary(); stopPending = false; }
+                lock (recordingGate) { beganUtc = DateTime.UtcNow; sessionClock.Reset(beganUtc, Stopwatch.GetTimestamp()); sessionElapsed.Restart(); clockStopUtc = DateTime.MinValue; sessionIncidentIds.Clear(); lastSampleUtc = DateTime.MinValue; sampleCount = 0; fault = false; notice = ""; latest = null; latestInternet = null; internetSummary = new InternetSessionSummary(); stopPending = false; }
                 AutomaticSessionLog created = new AutomaticSessionLog(logRoot); lock (recordingGate) { automaticLog = created; lastDirectory = created.SessionDirectory; }
                 File.WriteAllText(Path.Combine(lastDirectory, "settings.txt"), "app_version=" + AppVersion + "\r\npurpose=pc_internet_status\r\nadapter=" + current.Name + "\r\nadapter_id=" + current.Id + "\r\ngateway=" + gateway + "\r\nreference=" + reference + "\r\ndns=" + DefaultDnsHost + "\r\nhttps=" + DefaultHttpsUrl + "\r\nhttps_expected_status=204\r\ngame_collection_requested=False\r\nprocess_traffic_requested=False\r\ntcp_rtt_requested=False\r\nrouting=Windows routing and proxy; not bound to selected adapter\r\ndiagnostics_file=" + DiagnosticsLog.FilePath + "\r\n", new UTF8Encoding(true));
                 lock (recordingGate) { history.Start(beganUtc); running = true; }
-                controller.Start(0, current.Id, gateway, reference, false, false);
+                controller.Start(0, current.Id, gateway, reference, false, false, String.IsNullOrEmpty(gatewayOverride));
                 if (!isolatedTest || liveInternetForTest) internet.Start(DefaultDnsHost, DefaultHttpsUrl);
                 DiagnosticsLog.Write("measurement_start", "purpose=pc_internet_status; session=" + lastDirectory);
                 historyDirty = true; SetControls(); timer.Start(); Poll();
@@ -102,19 +102,21 @@ namespace PcInternetMonitor
             {
                 lock (recordingGate)
                 {
-                    if (!running || automaticLog == null || probe.TimestampUtc < beganUtc) return;
+                    if (!running || automaticLog == null) return;
                     observed = automaticLog;
+                    CheckObservationClockLocked();
+                    if (probe.TimestampUtc < beganUtc) return;
                     if (!automaticLog.RecordProbe(kind, probe)) throw new IOException(automaticLog.ErrorMessage);
-                    RecordCheckLocked(new InternetCheckSample { Kind = kind, Target = probe.Target, StartedUtc = probe.TimestampUtc, TimestampUtc = probe.TimestampUtc, Success = probe.Countable && !probe.TimedOut && probe.RoundtripMs.HasValue, TimedOut = probe.TimedOut, DurationMs = probe.RoundtripMs, State = !probe.Countable ? "error" : probe.TimedOut ? "timeout" : "success", Status = probe.Status });
+                    RecordCheckLocked(new InternetCheckSample { Kind = kind, Target = probe.Target, StartedUtc = probe.TimestampUtc, TimestampUtc = probe.TimestampUtc, Success = probe.Countable && !probe.TimedOut && probe.RoundtripMs.HasValue, TimedOut = probe.TimedOut, DurationMs = probe.RoundtripMs, State = probe.NetworkFailure ? "failure" : !probe.Countable ? "error" : probe.TimedOut ? "timeout" : "success", Status = probe.Status });
                 }
             }
-            catch (Exception error) { QueueFailure("ICMP 기록 오류", error, observed); }
+            catch (Exception error) { QueueFailure(error is SessionClockChangedException ? ClockStopReason : "ICMP 기록 오류", error, observed); }
         }
         private void RecordInternetCheck(InternetCheckSample sample)
         {
             AutomaticSessionLog observed = null;
-            try { lock (recordingGate) { if (!running || automaticLog == null || sample.StartedUtc < beganUtc || sample.Generation != internet.Generation) return; observed = automaticLog; RecordCheckLocked(sample); } }
-            catch (Exception error) { QueueFailure("DNS/HTTPS 기록 오류", error, observed); }
+            try { lock (recordingGate) { if (!running || automaticLog == null || sample.Generation != internet.Generation) return; observed = automaticLog; CheckObservationClockLocked(sample); if (sample.StartedUtc < beganUtc) return; RecordCheckLocked(sample); } }
+            catch (Exception error) { QueueFailure(error is SessionClockChangedException ? ClockStopReason : "DNS/HTTPS 기록 오류", error, observed); }
         }
         private void RecordCheckLocked(InternetCheckSample sample)
         {
@@ -123,7 +125,15 @@ namespace PcInternetMonitor
         }
         private void RecordIncident(ConnectivityIncident incident)
         {
-            lock (recordingGate) { historyDirty = true; if (automaticLog != null && !automaticLog.AppendConnectivityIncident(incident)) throw new IOException(automaticLog.ErrorMessage); }
+            lock (recordingGate)
+            {
+                historyDirty = true;
+                if (!running || automaticLog == null) return;
+                if (incident.State == "open") sessionIncidentIds.Add(incident.Id);
+                if (!sessionIncidentIds.Contains(incident.Id)) return;
+                if (sessionIncidentIds.Count > 512) sessionIncidentIds.IntersectWith(history.GetRecent(500).Select(x => x.Id));
+                if (!automaticLog.AppendConnectivityIncident(incident)) throw new IOException(automaticLog.ErrorMessage);
+            }
         }
         private void QueueFailure(string stage, Exception error, AutomaticSessionLog expected)
         {
@@ -137,30 +147,35 @@ namespace PcInternetMonitor
             if (!running) return;
             try
             {
+                lock (recordingGate) { if (stopPending) return; CheckObservationClockLocked(); }
                 if (nextPollErrorForTest != null) { Exception error = nextPollErrorForTest; nextPollErrorForTest = null; throw error; }
                 MonitorSnapshot snapshot = controller.Snapshot(); InternetCheckSnapshot checks = isolatedTest && !liveInternetForTest ? latestInternet : internet.Snapshot(DateTime.UtcNow);
                 lock (recordingGate)
                 {
+                    if (stopPending) return;
+                    CheckObservationClockLocked();
                     if (automaticLog == null || !automaticLog.Append(snapshot)) throw new IOException(automaticLog == null ? "기록기가 없습니다." : automaticLog.ErrorMessage);
                     internetSummary.ObserveSnapshot(snapshot); history.ObserveAdapter(snapshot.TimestampUtc, snapshot.AdapterCountersAvailable, snapshot.AdapterStatus); history.CheckGaps(snapshot.TimestampUtc);
                     sampleCount = automaticLog.SampleCount; lastSampleUtc = snapshot.TimestampUtc; latest = snapshot; latestInternet = checks;
                 }
                 snapshot.EndpointObservations.Clear(); snapshot.Endpoints.Clear(); snapshot.ProcessTraffic.Rows.Clear(); snapshot.TcpRtt.Connections.Clear(); RefreshPresentation();
             }
-            catch (Exception error) { StopSession("검사 기록 오류", error); }
+            catch (Exception error) { StopSession(error is SessionClockChangedException ? ClockStopReason : "검사 기록 오류", error); }
         }
         private void StopSession(string reason, Exception failure)
         {
-            timer.Stop();
+            timer.Stop(); sessionElapsed.Stop();
             if (!running && automaticLog == null) { if (failure != null) { fault = true; stopReason = reason + ": " + failure.Message; } RefreshPresentation(); return; }
+            lock (recordingGate) { try { CheckObservationClockLocked(); } catch (SessionClockChangedException error) { reason = ClockStopReason; failure = error; } }
             DiagnosticsLog.Write("measurement_stop_requested", "reason=" + reason, failure);
-            try { internet.Stop(); MonitorSnapshot final = controller.StopAndSnapshot(); lock (recordingGate) { if (final != null && automaticLog != null) { if (!automaticLog.Append(final)) throw new IOException(automaticLog.ErrorMessage); internetSummary.ObserveSnapshot(final); latest = final; sampleCount = automaticLog.SampleCount; lastSampleUtc = final.TimestampUtc; } } }
+            try { internet.Stop(); MonitorSnapshot final = controller.StopAndSnapshot(); lock (recordingGate) { if (final != null && automaticLog != null) { try { CheckObservationClockLocked(); } catch (SessionClockChangedException error) { reason = ClockStopReason; failure = error; } if (clockStopUtc == DateTime.MinValue && !automaticLog.Append(final)) throw new IOException(automaticLog.ErrorMessage); internetSummary.ObserveSnapshot(final); latest = final; sampleCount = automaticLog.SampleCount; if (clockStopUtc == DateTime.MinValue) lastSampleUtc = final.TimestampUtc; } } }
             catch (Exception error) { failure = failure ?? error; DiagnosticsLog.Write("measurement_final_failed", reason, error); }
             finally { try { internet.Stop(); } catch (Exception error) { failure = failure ?? error; } try { controller.Stop(); } catch (Exception error) { failure = failure ?? error; } }
             AutomaticSessionLog completed;
+            DateTime endUtc = clockStopUtc != DateTime.MinValue ? clockStopUtc : sessionClock.LastStableUtc;
             lock (recordingGate)
             {
-                try { history.Stop(DateTime.UtcNow, reason); } catch (Exception error) { failure = failure ?? error; }
+                try { history.Stop(endUtc, reason); } catch (Exception error) { failure = failure ?? error; }
                 running = false; completed = automaticLog; automaticLog = null; fault = failure != null; stopReason = reason + (failure == null ? "" : ": " + failure.Message); historyDirty = true;
             }
             if (completed != null)
@@ -169,13 +184,14 @@ namespace PcInternetMonitor
                 {
                     if (failure != null) File.AppendAllText(Path.Combine(completed.SessionDirectory, "errors.txt"), DateTime.UtcNow.ToString("o") + "\r\n" + reason + "\r\n" + failure + "\r\n", new UTF8Encoding(true));
                     completed.Complete(reason); if (!completed.IsHealthy) { fault = true; stopReason = "기록 저장 오류: " + completed.ErrorMessage; }
-                    string text = "PC 인터넷 모니터 " + AppVersion + "\r\n저장 상태: " + (completed.IsHealthy ? "파일 기록 완료" : "오류") + "\r\n" + internetSummary.BuildText(history.GetRecent(500).Where(x => x.StartedUtc >= beganUtc).ToList(), history.DroppedCount, DateTime.UtcNow, reason);
+                    string text = "PC 인터넷 모니터 " + AppVersion + "\r\n저장 상태: " + (completed.IsHealthy ? "파일 기록 완료" : "오류") + "\r\n" + internetSummary.BuildText(history.GetRecent(500).Where(x => sessionIncidentIds.Contains(x.Id)).ToList(), history.DroppedCount, endUtc, reason);
                     File.WriteAllText(Path.Combine(completed.SessionDirectory, "summary.txt"), text, new UTF8Encoding(true));
                 }
                 catch (Exception error) { fault = true; stopReason = "기록 마무리 오류: " + error.Message; DiagnosticsLog.Write("recording_complete_failed", reason, error); }
                 finally { completed.Dispose(); }
             }
             SetControls(); RefreshPresentation(); DiagnosticsLog.Write("measurement_stopped", stopReason);
+            if (clockStopUtc != DateTime.MinValue && trayReady && !IsVisible && !isolatedTest) { try { trayIcon.ShowBalloonTip(5000, "PC 인터넷 모니터", ClockStopReason, System.Windows.Forms.ToolTipIcon.Warning); } catch (Exception error) { DiagnosticsLog.Write("clock_stop_notice_failed", "tray notification", error); } }
         }
         internal void EnableBackgroundTray()
         {

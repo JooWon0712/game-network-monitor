@@ -103,7 +103,7 @@ namespace PcInternetMonitor
                 trayStartItem.Enabled = usable && !running && !stopPending && adapterPicker.SelectedItem is AdapterInfo;
                 trayStopItem.Enabled = usable && running && !stopPending;
                 trayExitItem.Enabled = usable;
-                string status = trayExitRequested ? "종료 중" : fault ? "기록 오류" : running ? "검사 중" : "검사 중지";
+                string status = trayExitRequested ? "종료 중" : !running && clockStopUtc != DateTime.MinValue ? "시각 변경으로 중지" : fault ? "기록 오류" : running ? "검사 중" : "검사 중지";
                 string text = "PC Internet Monitor " + AppVersion + " | " + status;
                 if (text.Length > 63) text = text.Substring(0, 63);
                 if (trayIcon.Text != text) trayIcon.Text = text;

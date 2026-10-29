@@ -189,6 +189,19 @@ namespace PcInternetMonitor
             }
         }
 
+        public void ChangeTarget(string kind, string target, DateTime utc)
+        {
+            kind = CanonicalKind(kind); if (kind == null) return;
+            List<ConnectivityIncident> changes = new List<ConnectivityIncident>();
+            lock (gate)
+            {
+                CheckStream stream;
+                if (!running || !streams.TryGetValue(kind, out stream) || String.Equals(stream.Target, target, StringComparison.Ordinal)) return;
+                Close(stream, stream.LastUtc, "검사 대상 변경 · 이전 이상 회복 미확인", changes);
+                streams.Remove(kind);
+            }
+            Publish(changes);
+        }
         public void Stop(DateTime utc, string reason)
         {
             utc = Utc(utc);

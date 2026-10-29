@@ -13,7 +13,7 @@ namespace PcInternetMonitor
 {
     public static class App
     {
-        public const string Version = "0.2.3";
+        public const string Version = "0.2.4";
         private static string exitContext = "명시적 종료 요청 미확인";
         private static volatile bool unhandledExceptionSeen;
 
@@ -54,7 +54,7 @@ namespace PcInternetMonitor
 
         private static bool IsTestMode(string mode)
         {
-            return mode == "--tray-test" || mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test" || mode == "--tcp-rtt-test" || mode == "--internet-test" || mode == "--internet-loopback-test" || mode == "--internet-recording-test";
+            return mode == "--feedback-test" || mode == "--tray-test" || mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test" || mode == "--tcp-rtt-test" || mode == "--internet-test" || mode == "--internet-loopback-test" || mode == "--internet-recording-test";
         }
 
         private static int Run(string[] args)
@@ -71,7 +71,7 @@ namespace PcInternetMonitor
                     AdapterCounterTotals.SelfTest(); MeasurementQuality.SelfTest();
                     FinalSnapshotTests.SelfTest(testDir);
                     GameCheckPresentation.SelfTest(); TcpRttMonitor.SelfTest(); TcpRttLoggingTests.SelfTest(testDir); TcpRttPresentation.SelfTest();
-                    InternetCheckRunner.SelfTest(); ConnectivityHistory.SelfTest(); InternetLoggingTests.SelfTest(testDir);
+                    InternetCheckRunner.SelfTest(); ConnectivityHistory.SelfTest(); InternetLoggingTests.SelfTest(testDir); SessionClockGuard.SelfTest(); ClockGuardTests.SelfTest(testDir); GatewayRefreshTests.SelfTest();
                     Directory.CreateDirectory(testDir);
                     File.WriteAllText(Path.Combine(testDir, "self-test.txt"), "PASS v" + Version + ": DNS/HTTPS timeout/cancel/generation/freshness, connectivity failure/recovery/gap/history, CSV dedup/flush/archive/PC summary, retained ETW/probe/adapter/TCP RTT synthetic regression checks. No live network or performance validation in this test.\r\n", Encoding.UTF8);
                     return 0;
@@ -91,6 +91,13 @@ namespace PcInternetMonitor
                 app.Exit += delegate(object sender, ExitEventArgs e) {
                     DiagnosticsLog.Write("application_exit", "exit_code=" + e.ApplicationExitCode + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
                 };
+                if (mode == "--feedback-test")
+                {
+                    app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                    try { MainWindow.RunFeedbackTests(Path.Combine(testDir, "feedback-test.txt")); }
+                    finally { app.Shutdown(); }
+                    return 0;
+                }
                 if (mode == "--tray-test")
                 {
                     app.ShutdownMode = ShutdownMode.OnExplicitShutdown;

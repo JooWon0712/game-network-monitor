@@ -46,7 +46,7 @@ namespace PcInternetMonitor
                 Check(versions[0].Length == 15 && versions[1][13] == expectedSummary && versions[2][6] == "recovered" && versions[2][9].Length > 0 && versions[2][10] == "", "incident versions or recovery columns changed");
                 Check(versions[3][6] == "ended" && versions[3][9] == "" && versions[3][10].Length > 0, "recording stop became a recovery");
                 string metadata = File.ReadAllText(Path.Combine(session, "session.txt"), Encoding.UTF8);
-                Check(metadata.Contains("format_version=5") && metadata.Contains("internet_checks_written=2") && metadata.Contains("connectivity_incident_versions_written=3") && metadata.Contains("state=completed"), "new writers did not finish and report counts");
+                Check(metadata.Contains("format_version=6") && metadata.Contains("internet_checks_written=2") && metadata.Contains("connectivity_incident_versions_written=3") && metadata.Contains("state=completed"), "new writers did not finish and report counts");
                 foreach (string name in new string[] { "samples.csv", "marks.csv", "probes.csv", "process-traffic.csv", "game-endpoints.csv", "tcp-rtt.csv" })
                     Check(File.ReadAllText(Path.Combine(session, name), Encoding.UTF8).Length > 0, "existing writer missing or empty: " + name);
                 IList<ConnectivityIncident> loaded = ConnectivityHistoryArchive.LoadRecent(fixture, 500);
