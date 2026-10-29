@@ -4,11 +4,17 @@
 
 현재 버전은 **0.2.1**이며 저장소 이름은 **`pc-internet-monitor`**입니다. 소스 저장소: [JooWon0712/pc-internet-monitor](https://github.com/JooWon0712/pc-internet-monitor).
 
-실행 파일은 **`PcInternetMonitor.exe`**입니다. 기록은 실행 파일 옆의 `logs/` 폴더에 저장합니다. Windows 10/11 64비트와 .NET Framework 4.8 환경용이며, 별도 드라이버·Python·Node 설치가 필요하지 않습니다.
+## 다운로드
+
+**[PcInternetMonitor.exe 다운로드](https://github.com/JooWon0712/pc-internet-monitor/releases/latest/download/PcInternetMonitor.exe)** · [릴리스 안내](https://github.com/JooWon0712/pc-internet-monitor/releases/latest)
+
+실행 환경은 **Windows 10/11 64비트(x64)**와 **.NET Framework 4.8**입니다. 별도 드라이버·Python·Node 설치는 필요하지 않습니다.
+
+설치 없이 `PcInternetMonitor.exe` 하나를 실행하면 됩니다. 아이콘은 실행 파일에 내장돼 있으며, 기본 기능은 일반 권한으로 사용하도록 구성돼 있습니다. 파일은 기록을 저장할 수 있는 폴더에 두세요. 측정 기록은 실행 파일 옆의 `logs/`, 진단 기록은 `diagnostics/`에 생성됩니다.
 
 ## 사용
 
-1. `PcInternetMonitor.exe`를 실행하고 **PC 연결 · 랜선 / Wi-Fi**에서 확인할 연결을 고릅니다.
+1. 다운로드한 `PcInternetMonitor.exe`를 실행하고 **PC 연결 · 랜선 / Wi-Fi**에서 확인할 연결을 고릅니다.
 2. **검사 시작**을 누릅니다. 실행 직후에는 검사하거나 기록하지 않습니다.
 3. 네 가지 검사 결과와 **끊김 · 검사 실패 이력**을 확인합니다.
 4. **검사 중지**로 기록을 마무리하고 **기록 폴더**에서 원본과 요약을 확인합니다.
@@ -80,6 +86,8 @@ HTTPS는 Windows/.NET의 기본 인증서 검증과 프록시 설정을 사용�
 ```
 
 버전별 EXE·테스트 실행 사본·ZIP 백업은 만들지 않습니다. 업데이트는 같은 `PcInternetMonitor.exe`를 교체하며 이미 열린 사용자 창은 강제로 닫지 않습니다. 새 버전은 다음 실행부터 적용됩니다.
+
+배포용 EXE는 [GitHub Releases](https://github.com/JooWon0712/pc-internet-monitor/releases)에 첨부합니다. 실행 파일과 로컬 기록·테스트 산출물은 `.gitignore`로 Git 추적 대상에서 제외합니다.
 
 검사 모드는 고정 EXE를 사용하며 결과를 `tests/`에 저장합니다.
 
