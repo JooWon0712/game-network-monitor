@@ -44,6 +44,7 @@ namespace PcInternetMonitor
         public MainWindow(StartupSelection selection, string recordingRoot)
         {
             logRoot = recordingRoot ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs"); isolatedTest = recordingRoot != null;
+            InitializeWindowFrame();
             Title = "PC 인터넷 모니터 " + AppVersion; Background = Brush(BackColor); Foreground = Brush(TextColor); FontFamily = TerminalFont;
             UseLayoutRounding = true; SnapsToDevicePixels = true; TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display); TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
             MaxWidth = SystemParameters.WorkArea.Width; MaxHeight = SystemParameters.WorkArea.Height;

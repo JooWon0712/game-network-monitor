@@ -13,7 +13,7 @@ namespace PcInternetMonitor
 {
     public static class App
     {
-        public const string Version = "0.2.2";
+        public const string Version = "0.2.3";
         private static string exitContext = "명시적 종료 요청 미확인";
         private static volatile bool unhandledExceptionSeen;
 
