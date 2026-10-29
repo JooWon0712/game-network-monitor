@@ -38,7 +38,7 @@ namespace PcInternetMonitor
             historyList.Background = Brush(PanelColor); historyList.Foreground = Brush(TextColor); historyList.BorderThickness = new Thickness(0); historyList.HorizontalContentAlignment = HorizontalAlignment.Stretch; historyList.Padding = new Thickness(7); historyList.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, ScrollBarVisibility.Disabled); Grid.SetRow(historyList, 5); main.Children.Add(historyList);
             Style historyItemStyle = new Style(typeof(ListBoxItem)); historyItemStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brush(PanelColor))); historyItemStyle.Setters.Add(new Setter(Control.ForegroundProperty, Brush(TextColor))); historyItemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0))); historyItemStyle.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch)); historyItemStyle.Setters.Add(new Setter(Control.FocusVisualStyleProperty, null));
             Trigger selectedRow = new Trigger { Property = ListBoxItem.IsSelectedProperty, Value = true }; selectedRow.Setters.Add(new Setter(Control.BackgroundProperty, Brush(Color.FromRgb(32, 38, 45)))); selectedRow.Setters.Add(new Setter(Control.ForegroundProperty, Brush(TextColor))); historyItemStyle.Triggers.Add(selectedRow); historyList.ItemContainerStyle = historyItemStyle;
-            TextBlock foot = Text("DNS·HTTPS는 약 5초 간격 · 이력은 2회 연속 실패부터 기록(PC 연결 끊김은 즉시)\n특정 검사 대상의 결과이며 인터넷 전체의 정상·장애를 보장하지 않습니다. 검사는 시작 버튼을 누른 동안만 실행됩니다.", 11, MutedColor, false); foot.ToolTip = RouteNote + "\nDNS는 시스템 캐시·hosts 결과를 포함할 수 있습니다. HTTPS 시간에는 DNS/TCP/TLS/서버 응답 시간이 포함되며 순수 회선 핑이 아닙니다.";
+            TextBlock foot = Text("X: 트레이로 숨김 · 완전 종료: 트레이 메뉴 > 종료\nDNS·HTTPS 약 5초 간격 · 이력은 연속 2회 실패부터 기록 · 전체 인터넷의 상태를 보장하지 않음", 11, MutedColor, false); foot.ToolTip = RouteNote + "\nDNS는 시스템 캐시·hosts 결과를 포함할 수 있습니다. HTTPS 시간에는 DNS/TCP/TLS/서버 응답 시간이 포함되며 순수 회선 핑이 아닙니다.";
             dashboardFooter = new Border { BorderBrush = Brush(BorderColor), BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(0, 9, 0, 0), Margin = new Thickness(0, 10, 0, 0), Child = foot }; Grid.SetRow(dashboardFooter, 6); main.Children.Add(dashboardFooter); return main;
         }
         private void AddCheckCard(int column, string key, string title, string scope)
@@ -51,6 +51,7 @@ namespace PcInternetMonitor
         }
         private void RefreshPresentation()
         {
+            UpdateTrayState();
             Color color = fault ? ErrorColor : running ? AccentColor : MutedColor;
             recordingTitle.Text = fault ? "[!] 오류로 검사 중지" : running ? "[*] 검사 · 기록 중" : "[-] 검사 중지"; recordingTitle.Foreground = Brush(color); recordingBanner.BorderBrush = Brush(color);
             recordingDetail.Text = running ? "진행 " + (DateTime.UtcNow - beganUtc).ToString(@"hh\:mm\:ss") + " · 기록 " + sampleCount.ToString("N0") + "개 · 마지막 관측 " + (lastSampleUtc == DateTime.MinValue ? "대기" : lastSampleUtc.ToLocalTime().ToString("HH:mm:ss")) : stopReason;

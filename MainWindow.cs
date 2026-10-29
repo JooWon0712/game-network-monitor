@@ -31,7 +31,7 @@ namespace PcInternetMonitor
         private AutomaticSessionLog automaticLog;
         private InternetSessionSummary internetSummary = new InternetSessionSummary();
         private List<ConnectivityIncident> archived = new List<ConnectivityIncident>();
-        private bool running, disposed, fault, stopPending, historyDirty = true, liveInternetForTest;
+        private bool running, disposed, fault, stopPending, historyDirty = true, liveInternetForTest, sessionEnding;
         private DateTime beganUtc, lastSampleUtc;
         private string lastDirectory = "", notice = "", stopReason = "검사를 시작하면 연결 상태를 확인하고 기록합니다.", gatewayOverride, referenceOverride;
         private long sampleCount;
@@ -55,8 +55,8 @@ namespace PcInternetMonitor
             refreshButton.Click += delegate { RefreshSources(null); }; startButton.Click += delegate { StartSession(); }; stopButton.Click += delegate { StopSession("사용자 중지", null); }; logFolderButton.Click += delegate { OpenLogFolder(); };
             controller.ProbeSampled += RecordProbe; internet.Sampled += RecordInternetCheck; history.Changed += RecordIncident;
             timer.Interval = TimeSpan.FromSeconds(1); timer.Tick += delegate { Poll(); };
-            Closing += delegate { App.NoteExitRequest("창 닫기 요청"); DiagnosticsLog.Write("window_closing", "recording=" + running); DisposeMonitor(); };
-            Closed += delegate { DiagnosticsLog.Write("window_closed", "session=" + lastDirectory); };
+            Closing += HandleWindowClosing;
+            Closed += delegate { try { DisposeMonitor(); } finally { DisposeTray(); DiagnosticsLog.Write("window_closed", "session=" + lastDirectory); } };
             SetControls(); RefreshPresentation(); LoadHistory();
         }
         private void RefreshSources(string preferred)
@@ -176,9 +176,22 @@ namespace PcInternetMonitor
             }
             SetControls(); RefreshPresentation(); DiagnosticsLog.Write("measurement_stopped", stopReason);
         }
-        private void SetControls() { startButton.IsEnabled = !running && !disposed; stopButton.IsEnabled = running; adapterPicker.IsEnabled = refreshButton.IsEnabled = !running; }
+        internal void EnableBackgroundTray()
+        {
+            InitializeTray();
+            if (!trayReady) { notice = "트레이를 사용할 수 없습니다. X를 누르면 검사를 마무리하고 종료합니다."; RefreshPresentation(); }
+        }
+        internal void AllowSystemShutdown() { sessionEnding = true; }
+        private void HandleWindowClosing(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            if (!trayExitRequested && !sessionEnding && !disposed && trayReady && HideToTray()) { e.Cancel = true; return; }
+            App.NoteExitRequest(sessionEnding ? "Windows 종료 요청" : trayExitRequested ? "트레이 종료 요청" : "창 닫기 요청");
+            DiagnosticsLog.Write("window_closing", "recording=" + running + "; session_ending=" + sessionEnding + "; tray_exit=" + trayExitRequested);
+            try { DisposeMonitor(); } finally { DisposeTray(); }
+        }
+        private void SetControls() { startButton.IsEnabled = !running && !disposed; stopButton.IsEnabled = running && !disposed; adapterPicker.IsEnabled = refreshButton.IsEnabled = !running; UpdateTrayState(); }
         private void OpenLogFolder() { try { string path = lastDirectory.Length == 0 ? logRoot : lastDirectory; Directory.CreateDirectory(path); Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); } catch (Exception error) { notice = "기록 폴더 열기 실패: " + error.Message; RefreshPresentation(); } }
-        private void DisposeMonitor() { if (disposed) return; try { StopSession("창 닫기", null); } finally { disposed = true; timer.Stop(); internet.Dispose(); controller.Dispose(); } }
+        private void DisposeMonitor() { if (disposed) return; try { StopSession(sessionEnding ? "Windows 종료" : trayExitRequested ? "트레이 종료" : "창 닫기", null); } finally { disposed = true; timer.Stop(); internet.Dispose(); controller.Dispose(); } }
         private static SolidColorBrush Brush(Color color) { SolidColorBrush b = new SolidColorBrush(color); b.Freeze(); return b; }
         private static TextBlock Text(string value, double size, Color color, bool bold) { return new TextBlock { Text = value, FontSize = size, Foreground = Brush(color), FontWeight = bold ? FontWeights.SemiBold : FontWeights.Normal, TextWrapping = TextWrapping.Wrap }; }
         private static string Ms(double value) { return value == 0 ? "1 ms 미만" : value.ToString("N1", CultureInfo.CurrentCulture) + " ms"; }

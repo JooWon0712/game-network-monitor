@@ -13,7 +13,7 @@ namespace PcInternetMonitor
 {
     public static class App
     {
-        public const string Version = "0.2.1";
+        public const string Version = "0.2.2";
         private static string exitContext = "명시적 종료 요청 미확인";
         private static volatile bool unhandledExceptionSeen;
 
@@ -54,7 +54,7 @@ namespace PcInternetMonitor
 
         private static bool IsTestMode(string mode)
         {
-            return mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test" || mode == "--tcp-rtt-test" || mode == "--internet-test" || mode == "--internet-loopback-test" || mode == "--internet-recording-test";
+            return mode == "--tray-test" || mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test" || mode == "--tcp-rtt-test" || mode == "--internet-test" || mode == "--internet-loopback-test" || mode == "--internet-recording-test";
         }
 
         private static int Run(string[] args)
@@ -87,10 +87,17 @@ namespace PcInternetMonitor
                     DiagnosticsLog.Write("dispatcher_unhandled_exception", "handled=" + e.Handled, e.Exception);
                     // Do not set Handled=true or continue after an unknown UI failure.
                 };
-                app.SessionEnding += delegate(object sender, SessionEndingCancelEventArgs e) { NoteExitRequest("Windows 종료 요청: " + e.ReasonSessionEnding); };
+                app.SessionEnding += delegate(object sender, SessionEndingCancelEventArgs e) { foreach (Window owned in app.Windows) { MainWindow monitor = owned as MainWindow; if (monitor != null) monitor.AllowSystemShutdown(); } NoteExitRequest("Windows 종료 요청: " + e.ReasonSessionEnding); };
                 app.Exit += delegate(object sender, ExitEventArgs e) {
                     DiagnosticsLog.Write("application_exit", "exit_code=" + e.ApplicationExitCode + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
                 };
+                if (mode == "--tray-test")
+                {
+                    app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                    try { MainWindow.RunTrayTests(Path.Combine(testDir, "tray-test.txt")); }
+                    finally { app.Shutdown(); }
+                    return 0;
+                }
                 MainWindow window = mode == "--recording-test" || mode == "--smoke-test" || mode == "--internet-recording-test" ? new MainWindow(null, Path.Combine(testDir, "internet-ui-fixture-" + Guid.NewGuid().ToString("N"))) : new MainWindow(StartupSelection.FromArgs(args));
                 if (mode == "--internet-recording-test") { window.InternetRecordingTest(Path.Combine(testDir, "internet-recording-test.txt")); window.Close(); app.Shutdown(); return 0; }
                 if (mode == "--lifecycle-test")
@@ -115,6 +122,7 @@ namespace PcInternetMonitor
                     File.WriteAllText(Path.Combine(testDir, "smoke-test.txt"), "PASS v" + Version + ": PC internet dashboard, four checks, DNS/HTTPS success/failure/stale/stopped, persistent history merge, fixed connection controls and scrollable history. Synthetic UI only, no network or UAC.\r\n", Encoding.UTF8);
                     app.Shutdown(); return 0;
                 }
+                if (!IsTestMode(mode)) window.EnableBackgroundTray();
                 return app.Run(window);
             }
             catch (Exception e)
