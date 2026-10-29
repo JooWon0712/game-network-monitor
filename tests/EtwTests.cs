@@ -1,5 +1,5 @@
 using System;
-using GameNetworkMonitor;
+using PcInternetMonitor;
 
 internal static class EtwTests
 {

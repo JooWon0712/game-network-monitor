@@ -6,12 +6,13 @@ using System.IO;
 using System.Linq;
 using System.Text;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     public sealed class MonitorController : IDisposable
     {
         private readonly object gate = new object();
         private readonly KernelNetworkMonitor trace = new KernelNetworkMonitor();
+        private readonly TcpRttMonitor tcpRtt = new TcpRttMonitor();
         private readonly ProbeRunner gatewayProbe = new ProbeRunner();
         private readonly ProbeRunner referenceProbe = new ProbeRunner();
         private readonly TrafficWindow traffic = new TrafficWindow();
@@ -19,22 +20,27 @@ namespace GameNetworkMonitor
         private readonly ProbeWindow reference = new ProbeWindow();
         private AdapterReader adapter;
         private AdapterSample baseline, previous;
+        private readonly AdapterCounterTotals adapterTotals = new AdapterCounterTotals();
         private bool running, disposed;
         private int pid;
         private string processName;
         private DateTime processStarted, began;
         private bool processEnded;
         private bool gameRequested, processesRequested;
+        private long captureGeneration;
         public event Action<string, ProbeSample> ProbeSampled;
 
         public MonitorController()
         {
-            trace.EventReceived += delegate(TrafficEvent e) {
-                e.ObservedUtc = DateTime.UtcNow;
-                lock (gate) { if (running && !processEnded && e.ProcessId == pid && e.TimestampUtc >= began) traffic.Add(e); }
-            };
+            trace.EventReceived += AcceptTraffic;
             gatewayProbe.Sampled += delegate(ProbeSample s) { AcceptProbe("gateway", s, gateway); };
             referenceProbe.Sampled += delegate(ProbeSample s) { AcceptProbe("reference", s, reference); };
+        }
+
+        private void AcceptTraffic(TrafficEvent e)
+        {
+            e.ObservedUtc = DateTime.UtcNow;
+            lock (gate) { if (running && e.CaptureGeneration == captureGeneration && !processEnded && e.ProcessId == pid && e.TimestampUtc >= began) traffic.Add(e); }
         }
 
         private void AcceptProbe(string kind, ProbeSample sample, ProbeWindow window)
@@ -73,26 +79,35 @@ namespace GameNetworkMonitor
             lock (gate)
             {
                 pid = processId; processName = name; processStarted = started; processEnded = false;
+                captureGeneration++;
                 gameRequested = collectGame && processId > 0; processesRequested = collectProcesses;
                 traffic.Clear(); gateway.Clear(gatewayTarget); reference.Clear(referenceTarget);
                 adapter = new AdapterReader(adapterId);
                 baseline = previous = adapter.Read();
+                adapterTotals.Clear(); adapterTotals.Update(baseline);
                 began = DateTime.UtcNow; running = true;
             }
             if (!String.IsNullOrEmpty(gatewayTarget)) gatewayProbe.Start(gatewayTarget);
             if (!String.IsNullOrEmpty(referenceTarget)) referenceProbe.Start(referenceTarget);
-            if (gameRequested || collectProcesses) trace.Start(gameRequested ? processId : 0, collectProcesses);
+            if (gameRequested) tcpRtt.Start(processId, started);
+            if (gameRequested || collectProcesses) trace.Start(gameRequested ? processId : 0, collectProcesses, captureGeneration);
         }
 
         public MonitorSnapshot Snapshot()
+        {
+            return SnapshotCore(null);
+        }
+
+        private MonitorSnapshot SnapshotCore(TraceStopResult final)
         {
             bool stopTrace = false;
             MonitorSnapshot s;
             lock (gate)
             {
                 DateTime now = DateTime.UtcNow;
-                s = new MonitorSnapshot { TimestampUtc = now, Running = running, ProcessId = pid, ProcessName = processName, GameCollectionRequested = gameRequested, ProcessCollectionRequested = processesRequested };
-                s.Trace = trace.GetHealth();
+                s = new MonitorSnapshot { TimestampUtc = now, Running = running, IsFinal = final != null, ProcessId = pid, ProcessName = processName, GameCollectionRequested = gameRequested, ProcessCollectionRequested = processesRequested };
+                s.Trace = final == null ? trace.GetHealth() : final.Health;
+                if (final != null) { s.StopDrainComplete = final.Drained; s.StopBoundaryStatus = final.Status; s.StopRequestedUtc = final.RequestedUtc; }
                 if (running && pid > 0 && !processEnded)
                 {
                     try
@@ -110,20 +125,36 @@ namespace GameNetworkMonitor
                     if (processEnded && !processesRequested) stopTrace = true;
                 }
                 s.GameStatus = !running ? "측정 중지" : pid <= 0 ? "게임 선택 안 함 · PC/공유기 측정 중" : processEnded ? "선택한 게임 종료됨 · 새 프로세스를 선택하세요" : processName + " · PID " + pid.ToString(CultureInfo.InvariantCulture);
+                s.GameProcessEnded = processEnded;
+                s.TcpRtt = tcpRtt.Snapshot(now);
+                if (!running || processEnded)
+                {
+                    s.TcpRtt.Available = false; s.TcpRtt.MinimumMs = s.TcpRtt.MaximumMs = null;
+                    s.TcpRtt.State = processEnded ? "process_ended" : "stopped";
+                    s.TcpRtt.Status = processEnded ? "게임 종료" : "측정 중지";
+                }
                 traffic.Fill(s, now, began);
-                s.GameRatesAvailable = running && gameRequested && !processEnded && s.Trace.Active && (s.GameSentEvents + s.GameReceivedEvents + s.RetransmitEvents > 0);
-                if (running && processesRequested) s.ProcessTraffic = trace.GetProcessTraffic(now);
+                s.GameRatesAvailable = gameRequested && (s.GameSentEvents + s.GameReceivedEvents + s.RetransmitEvents > 0) && (final != null || (running && !processEnded && s.Trace.Active));
+                if (final != null) s.ProcessTraffic = final.ProcessTraffic;
+                else if (running && processesRequested) s.ProcessTraffic = trace.GetProcessTraffic(now);
                 s.Gateway = gateway.Summary(now);
                 s.Reference = reference.Summary(now);
                 if (adapter != null)
                 {
+                    s.AdapterExpected = true;
                     AdapterSample current = adapter.Read();
                     s.AdapterStatus = current.Status;
                     FillAdapter(s, current, previous, baseline);
+                    AdapterCounterTotalsSnapshot counters = adapterTotals.Update(current);
+                    s.AdapterCountersAvailable = counters.Available;
+                    s.AdapterReceiveErrors = counters.ReceiveErrors; s.AdapterSendErrors = counters.SendErrors;
+                    s.AdapterReceiveDiscards = counters.ReceiveDiscards; s.AdapterSendDiscards = counters.SendDiscards;
+                    s.AdapterCounterResets = counters.ResetCount; s.AdapterCounterGaps = counters.GapCount;
+                    if (counters.HasDiscontinuity) s.AdapterStatus += " · 카운터 초기화 " + counters.ResetCount + "회 / 관측 공백 " + counters.GapCount + "회 · 관측 증가량 보존, 경계 구간 미확인";
                     previous = current;
                     if (current.Available && (baseline == null || !baseline.Available || CounterReset(current, baseline))) baseline = current;
                 }
-                if (!running) { s.AdapterRatesAvailable = false; s.AdapterCountersAvailable = false; }
+                if (!running && final == null) { s.AdapterRatesAvailable = false; s.AdapterCountersAvailable = false; }
             }
             if (stopTrace) { trace.Stop(); s.Trace = trace.GetHealth(); }
             return s;
@@ -154,17 +185,58 @@ namespace GameNetworkMonitor
         public void Stop()
         {
             lock (gate) running = false;
-            gatewayProbe.Stop(); referenceProbe.Stop(); trace.Stop();
+            gatewayProbe.Stop(); referenceProbe.Stop(); trace.Stop(); tcpRtt.Stop();
+        }
+
+        public MonitorSnapshot StopAndSnapshot(int drainTimeoutMilliseconds = 2500)
+        {
+            DateTime requested = DateTime.UtcNow;
+            bool needsTrace;
+            lock (gate) { if (!running) return null; needsTrace = gameRequested || processesRequested; }
+            TraceStopResult final;
+            TcpRttSnapshot lastTcp = null;
+            try
+            {
+                gatewayProbe.Stop(); referenceProbe.Stop();
+                // Keep acceptance enabled while the ETW consumer drains. Never wait under gate.
+                if (needsTrace) final = trace.StopAndCapture(drainTimeoutMilliseconds);
+                else { trace.Stop(); final = new TraceStopResult { Drained = true, Health = trace.GetHealth(), Status = "ETW 미요청 · 최종 PC/ICMP 표본 반영" }; }
+            }
+            finally
+            {
+                try { lastTcp = tcpRtt.Snapshot(DateTime.UtcNow); tcpRtt.Stop(); }
+                finally { lock (gate) running = false; }
+            }
+            final.RequestedUtc = requested;
+            lock (gate)
+            {
+                running = false;
+                MonitorSnapshot snapshot = SnapshotCore(final);
+                if (lastTcp != null && lastTcp.ProcessId == pid) snapshot.TcpRtt = lastTcp;
+                return snapshot;
+            }
         }
         public void Dispose()
         {
             if (disposed) return;
-            Stop(); disposed = true; gatewayProbe.Dispose(); referenceProbe.Dispose(); trace.Dispose();
+            Stop(); disposed = true; gatewayProbe.Dispose(); referenceProbe.Dispose(); trace.Dispose(); tcpRtt.Dispose();
         }
 
         public static void SelfTest()
         {
             DateTime now = DateTime.UtcNow;
+            using (MonitorController controller = new MonitorController())
+            {
+                controller.running = true; controller.captureGeneration = 2; controller.pid = 42; controller.began = now.AddSeconds(-1);
+                controller.AcceptTraffic(new TrafficEvent { CaptureGeneration = 1, ProcessId = 42, TimestampUtc = now, Bytes = 1024 });
+                controller.AcceptTraffic(new TrafficEvent { CaptureGeneration = 2, ProcessId = 42, TimestampUtc = now.AddSeconds(-2), Bytes = 1024 });
+                controller.AcceptTraffic(new TrafficEvent { CaptureGeneration = 2, ProcessId = 41, TimestampUtc = now, Bytes = 1024 });
+                controller.AcceptTraffic(new TrafficEvent { CaptureGeneration = 2, ProcessId = 42, TimestampUtc = now, Bytes = 512 });
+                controller.running = false;
+                controller.AcceptTraffic(new TrafficEvent { CaptureGeneration = 2, ProcessId = 42, TimestampUtc = now, Bytes = 1024 });
+                MonitorSnapshot accepted = new MonitorSnapshot(); controller.traffic.Fill(accepted, now, controller.began);
+                Check(accepted.GameReceivedEvents == 1, "old generation, pre-start, wrong PID or stopped callbacks contaminated the session");
+            }
             ProbeWindow p = new ProbeWindow(); p.Clear("127.0.0.1");
             p.Add(new ProbeSample { TimestampUtc = now.AddSeconds(-3), Target = "127.0.0.1", RoundtripMs = 10, Countable = true, Status = "응답" });
             p.Add(new ProbeSample { TimestampUtc = now.AddSeconds(-2), Target = "127.0.0.1", RoundtripMs = 14, Countable = true, Status = "응답" });
@@ -173,6 +245,11 @@ namespace GameNetworkMonitor
             ProbeSummary ps = p.Summary(now);
             Check(ps.Sent == 3 && ps.Missing == 1 && ps.Errors == 1 && Math.Abs(ps.MissingPercent.Value - 100.0 / 3) < .00001 && ps.VariationMs == 4 && !ps.CurrentMs.HasValue, "probe denominators");
             Check(p.Summary(now.AddSeconds(61)).Sent == 0, "probe rolling expiry");
+            Check(p.Summary(now.AddSeconds(61)).Stale, "expired probes must remain stale, not return to initial waiting");
+            ProbeWindow broken = new ProbeWindow(); broken.Clear("fixture");
+            broken.Add(new ProbeSample { TimestampUtc = now, Target = "fixture", Countable = true, RoundtripMs = 1 });
+            broken.Add(new ProbeSample { TimestampUtc = now.AddSeconds(1), Target = "fixture", Status = "도달 불가" });
+            Check(broken.Summary(now.AddSeconds(1)).CurrentError && broken.Summary(now.AddSeconds(1)).MissingPercent == 0, "latest probe failure is independent of historical zero timeout ratio");
             TrafficWindow tw = new TrafficWindow();
             tw.Add(new TrafficEvent { TimestampUtc = now, ProcessId = 1, Protocol = "UDP", IsSend = false, Bytes = 100, SourceAddress = "1.2.3.4", SourcePort = 12, DestinationAddress = "127.0.0.1", DestinationPort = 34 });
             tw.Add(new TrafficEvent { TimestampUtc = now, ProcessId = 1, Protocol = "TCP", IsSend = true, IsRetransmit = true, Bytes = 80, SourceAddress = "127.0.0.1", SourcePort = 35, DestinationAddress = "1.2.3.4", DestinationPort = 13 });
@@ -218,15 +295,16 @@ namespace GameNetworkMonitor
     {
         private readonly Queue<ProbeSample> samples = new Queue<ProbeSample>();
         private string target;
-        public void Clear(string value) { samples.Clear(); target = value ?? ""; }
-        public void Add(ProbeSample sample) { if (sample.Target == target) { samples.Enqueue(sample); Trim(sample.TimestampUtc); } }
+        private ProbeSample lastSample;
+        public void Clear(string value) { samples.Clear(); lastSample = null; target = value ?? ""; }
+        public void Add(ProbeSample sample) { if (sample.Target == target) { samples.Enqueue(sample); lastSample = sample; Trim(sample.TimestampUtc); } }
         private void Trim(DateTime now) { while (samples.Count > 0 && (now - samples.Peek().TimestampUtc).TotalSeconds > 60) samples.Dequeue(); }
         public ProbeSummary Summary(DateTime now)
         {
             Trim(now);
             ProbeSummary s = new ProbeSummary { Target = target, Status = String.IsNullOrEmpty(target) ? "검사 꺼짐" : "응답 대기" };
             double sum = 0, diffs = 0; int count = 0, pairs = 0; double? last = null;
-            ProbeSample latest = null;
+            ProbeSample latest = lastSample;
             foreach (ProbeSample sample in samples)
             {
                 latest = sample;
@@ -243,8 +321,13 @@ namespace GameNetworkMonitor
             if (pairs > 0) s.VariationMs = diffs / pairs;
             if (latest != null)
             {
+                s.LastSampleUtc = latest.TimestampUtc;
+                double age = (now - latest.TimestampUtc).TotalSeconds;
+                s.Stale = age < 0 || age >= 3;
+                s.CurrentError = !s.Stale && (!latest.Countable || (!latest.TimedOut && !latest.RoundtripMs.HasValue));
+                s.CurrentTimedOut = !s.Stale && latest.Countable && latest.TimedOut;
                 s.Status = latest.Status;
-                if ((now - latest.TimestampUtc).TotalSeconds < 3) s.CurrentMs = latest.RoundtripMs;
+                if (!s.Stale) s.CurrentMs = latest.RoundtripMs;
             }
             return s;
         }
@@ -337,6 +420,8 @@ namespace GameNetworkMonitor
         {
             CsvHeader += ",game_collection_requested,game_receive_delivery_idle_seconds,game_delivery_lag_mean_ms,game_delivery_lag_max_ms,game_last_receive_event_utc,game_last_receive_observed_utc,game_invalid_event_time_count,process_traffic_available,process_traffic_status,process_traffic_dropped_events";
             CsvHeader += ",process_collection_requested,pc_adapter_send_packets_s,pc_adapter_receive_packets_s,game_endpoint_evictions_total";
+            CsvHeader += ",is_final,stop_requested_utc,stop_drain_complete,stop_boundary_status,game_process_ended,adapter_counter_resets,adapter_counter_gaps";
+            CsvHeader += ",tcp_rtt_requested,tcp_rtt_available,tcp_rtt_state,tcp_rtt_status,tcp_rtt_observed_utc,tcp_rtt_min_ms,tcp_rtt_max_ms,tcp_rtt_connections_found,tcp_rtt_connections_tracked,tcp_rtt_connections_measured,tcp_rtt_connections_skipped,tcp_rtt_partial,tcp_rtt_stale,tcp_rtt_permission_denied,tcp_rtt_error_code,tcp_rtt_error_stage,game_ping_support,game_packet_loss_support";
         }
         private readonly List<KeyValuePair<DateTime, string>> marks = new List<KeyValuePair<DateTime, string>>();
         public int Count { get { return samples.Count; } }
@@ -357,6 +442,7 @@ namespace GameNetworkMonitor
         }
         public static string ToCsvRow(MonitorSnapshot s)
         {
+            TcpRttSnapshot tcp = s.TcpRtt ?? new TcpRttSnapshot();
             return String.Join(",", new string[] {
                 s.TimestampUtc.ToLocalTime().ToString("o"), Csv(s.ProcessName), s.ProcessId.ToString(CultureInfo.InvariantCulture), s.GameRatesAvailable ? "true" : "false",
                 Num(s.GameRatesAvailable ? (double?)s.GameSentBytesPerSecond : null), Num(s.GameRatesAvailable ? (double?)s.GameReceivedBytesPerSecond : null),
@@ -374,7 +460,12 @@ namespace GameNetworkMonitor
                 s.GameCollectionRequested ? "true" : "false", Num(s.GameRatesAvailable ? s.GameReceiveDeliveryIdleSeconds : null), Num(s.GameEventDeliveryLagMs), Num(s.GameMaxEventDeliveryLagMs),
                 s.GameLastReceiveEventUtc.HasValue ? s.GameLastReceiveEventUtc.Value.ToUniversalTime().ToString("o") : "", s.GameLastReceiveObservedUtc.HasValue ? s.GameLastReceiveObservedUtc.Value.ToUniversalTime().ToString("o") : "",
                 s.GameInvalidEventTimeCount.ToString(CultureInfo.InvariantCulture), s.ProcessTraffic.Available ? "true" : "false", Csv(s.ProcessTraffic.Status), s.ProcessTraffic.DroppedProcessEvents.ToString(CultureInfo.InvariantCulture),
-                s.ProcessCollectionRequested ? "true" : "false", Num(s.AdapterRatesAvailable ? (double?)s.AdapterSentPacketsPerSecond : null), Num(s.AdapterRatesAvailable ? (double?)s.AdapterReceivedPacketsPerSecond : null), s.GameEndpointEvictions.ToString(CultureInfo.InvariantCulture)
+                s.ProcessCollectionRequested ? "true" : "false", Num(s.AdapterRatesAvailable ? (double?)s.AdapterSentPacketsPerSecond : null), Num(s.AdapterRatesAvailable ? (double?)s.AdapterReceivedPacketsPerSecond : null), s.GameEndpointEvictions.ToString(CultureInfo.InvariantCulture),
+                s.IsFinal ? "true" : "false", s.StopRequestedUtc.HasValue ? s.StopRequestedUtc.Value.ToUniversalTime().ToString("o") : "", s.IsFinal ? s.StopDrainComplete ? "true" : "false" : "", Csv(s.StopBoundaryStatus),
+                s.GameProcessEnded ? "true" : "false", s.AdapterCounterResets.ToString(CultureInfo.InvariantCulture), s.AdapterCounterGaps.ToString(CultureInfo.InvariantCulture),
+                tcp.Requested ? "true" : "false", tcp.Available ? "true" : "false", Csv(tcp.State), Csv(tcp.Status), tcp.TimestampUtc == DateTime.MinValue ? "" : tcp.TimestampUtc.ToUniversalTime().ToString("o"),
+                Num(tcp.Available ? tcp.MinimumMs : null), Num(tcp.Available ? tcp.MaximumMs : null), tcp.ConnectionsFound.ToString(CultureInfo.InvariantCulture), tcp.ConnectionsTracked.ToString(CultureInfo.InvariantCulture), tcp.ConnectionsMeasured.ToString(CultureInfo.InvariantCulture), tcp.ConnectionsSkipped.ToString(CultureInfo.InvariantCulture),
+                tcp.Partial ? "true" : "false", tcp.Stale ? "true" : "false", tcp.PermissionDenied ? "true" : "false", tcp.NativeErrorCode.ToString(CultureInfo.InvariantCulture), Csv(tcp.ErrorStage), "unsupported", "unsupported"
             });
         }
         internal static string Csv(string s)

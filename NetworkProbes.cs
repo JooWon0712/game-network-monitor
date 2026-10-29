@@ -10,7 +10,7 @@ using System.Security;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     public static class AdapterCatalog
     {

@@ -1,6 +1,7 @@
 using System.Reflection;
-[assembly: AssemblyTitle("Game Network Monitor")]
-[assembly: AssemblyDescription("Selected process network metadata and local connection diagnostics")]
-[assembly: AssemblyProduct("Game Network Monitor")]
-[assembly: AssemblyVersion("0.1.8.0")]
-[assembly: AssemblyFileVersion("0.1.8.0")]
+[assembly: AssemblyTitle("PC Internet Monitor")]
+[assembly: AssemblyDescription("PC connection, DNS, HTTPS and connectivity incident diagnostics")]
+[assembly: AssemblyProduct("PC Internet Monitor")]
+[assembly: AssemblyVersion("0.2.1.0")]
+[assembly: AssemblyFileVersion("0.2.1.0")]
+[assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8")]

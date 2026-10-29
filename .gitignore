@@ -1,11 +1,16 @@
+# Build output and Windows file-replacement images
 *.exe
-GameNetworkMonitor.exe~RF*.TMP
+*.exe~RF*.TMP
 *.pdb
-tests/**/*.txt
-tests/**/*.png
-tests/**/*.csv
-tests/**/*.jsonl
+.build/
+
+# Generated validation data; keep reusable C# test source
+/tests/**
+!/tests/**/
+!/tests/**/*.cs
+/VALIDATION.md
+
+# Local measurement records, app diagnostics and analysis output
+logs/
 diagnostics/
 outputs/
-logs/
-.build/

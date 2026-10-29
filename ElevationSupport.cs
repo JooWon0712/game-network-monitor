@@ -4,7 +4,7 @@ using System.Globalization;
 using System.Security.Principal;
 using System.Text;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     // Carries only the visible selections; never starts measurement on launch.
     public sealed class StartupSelection

@@ -4,7 +4,7 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     // Kernel network events contain metadata, not the application's transmitted content.
     // These are ETW events/bytes, not counts of packets observed on the wire.
@@ -28,6 +28,8 @@ namespace GameNetworkMonitor
             internal readonly object HealthGate = new object();
             internal readonly TraceHealth Health = new TraceHealth();
             internal int ProcessId;
+            internal long CaptureGeneration;
+            internal bool Started, ConsumerStarted;
             internal string Name;
             internal IntPtr NameBuffer;
             internal IntPtr Properties;
@@ -37,6 +39,8 @@ namespace GameNetworkMonitor
             internal EventRecordCallback RecordCallback;
             internal BufferCallback BufferCallback;
             internal volatile bool Stopping;
+            internal volatile bool DrainRequested;
+            internal uint ConsumerExitCode;
             internal bool Finished;
             internal bool StopFailed;
             internal DateTime LastQueryUtc;
@@ -50,7 +54,7 @@ namespace GameNetworkMonitor
             Start(processId, false);
         }
 
-        public void Start(int processId, bool includeOtherProcesses)
+        public void Start(int processId, bool includeOtherProcesses, long captureGeneration = 0)
         {
             if (processId < 0 || (processId == 0 && !includeOtherProcesses)) throw new ArgumentOutOfRangeException("processId");
             lock (lifecycle)
@@ -60,8 +64,9 @@ namespace GameNetworkMonitor
                 if (current != null) return; // A previous own session could not be stopped; retain it for retry.
                 Context c = new Context();
                 c.ProcessId = processId;
+                c.CaptureGeneration = captureGeneration;
                 c.IncludeOtherProcesses = includeOtherProcesses;
-                c.Name = "GameNetworkMonitor-" + Guid.NewGuid().ToString("N");
+                c.Name = "PcInternetMonitor-" + Guid.NewGuid().ToString("N");
                 current = c;
                 string failureStage = "ETW 초기화";
                 try
@@ -105,6 +110,7 @@ namespace GameNetworkMonitor
                     if (c.Consumer == InvalidTrace) throw new Win32Exception(Marshal.GetLastWin32Error());
                     SetStatus(c, true, processId > 0 ? "게임 ETW 수집 중 · 선택한 PID의 TCP/UDP 메타데이터" :
                         "프로그램별 TCP/UDP 집계 중 · 모든 어댑터");
+                    c.Started = true;
                     c.Worker = new Thread(delegate() { Consume(c); });
                     c.Worker.IsBackground = true;
                     c.Worker.Name = "Game network ETW consumer";
@@ -132,7 +138,7 @@ namespace GameNetworkMonitor
             // Query loss counters at most once a second, independently from data callbacks.
             lock (c.NativeGate)
             {
-                if (c.Session != 0 && c.Properties != IntPtr.Zero &&
+                if (!c.DrainRequested && c.Session != 0 && c.Properties != IntPtr.Zero &&
                     (DateTime.UtcNow - c.LastQueryUtc).TotalSeconds >= 1)
                 {
                     c.LastQueryUtc = DateTime.UtcNow;
@@ -171,6 +177,93 @@ namespace GameNetworkMonitor
         public void Stop()
         {
             lock (lifecycle) StopLocked();
+        }
+
+        public TraceStopResult StopAndCapture(int timeoutMilliseconds)
+        {
+            TraceStopResult result = new TraceStopResult { RequestedUtc = DateTime.UtcNow };
+            Context c;
+            lock (lifecycle)
+            {
+                c = current;
+                if (c == null)
+                {
+                    result.Health = Clone(last); result.Drained = false;
+                    result.Status = "ETW 수집 세션 없음 · 최종 ETW 자료 미확인"; return result;
+                }
+                if (c.DrainRequested) { result.Health = GetHealth(); result.Status = "ETW 종료 처리 중 · 중복 종료 요청"; return result; }
+                c.DrainRequested = true;
+            }
+            uint stopCode = 0;
+            bool stopIssued = false;
+            bool wasActive; lock (c.HealthGate) wasActive = c.Health.Active;
+            try
+            {
+                ulong handle; IntPtr properties;
+                lock (c.NativeGate) { handle = c.Session; properties = c.Properties; }
+                // Keep callbacks and the consumer alive while STOP flushes the owned session.
+                // DrainRequested keeps the worker from freeing this control buffer meanwhile.
+                if (handle != 0 && properties != IntPtr.Zero)
+                {
+                    stopIssued = true;
+                    stopCode = ControlTrace(handle, null, properties, 1);
+                    lock (c.NativeGate)
+                    {
+                        if (stopCode == 0 || stopCode == 4201)
+                        {
+                            if (stopCode == 0) ReadLossCounters(c);
+                            c.Session = 0;
+                        }
+                        else c.StopFailed = true;
+                    }
+                }
+                bool finished = c.Worker == null || (c.Worker != Thread.CurrentThread && c.Worker.Join(Math.Max(0, timeoutMilliseconds)));
+                result.TimedOut = !finished; result.StopNativeCode = stopCode; result.ConsumerExitCode = c.ConsumerExitCode;
+                result.Drained = wasActive && c.Started && c.ConsumerStarted && stopIssued && finished && stopCode == 0 && c.ConsumerExitCode == 0;
+                result.Status = result.Drained ? "종료 버퍼·최종 구간 반영" : "종료 버퍼 반영 미확인 · 끝부분 누락 가능";
+                if (!c.Started || !c.ConsumerStarted) result.Status = "ETW 수집 시작/소비 확인 안 됨 · 최종 ETW 자료 미확인";
+                else if (!stopIssued) result.Status = "ETW 종료 제어 핸들 없음 · 최종 ETW 자료 미확인";
+                result.Status += " (STOP " + stopCode + ", consumer " + c.ConsumerExitCode + ", 대기초과 " + (!finished) + ")";
+            }
+            catch (Exception error)
+            {
+                result.Drained = false; result.Status = "종료 버퍼 반영 실패 · 끝부분 누락 가능";
+                SetFailure(c, error, "StopAndCapture");
+            }
+            finally
+            {
+                c.Stopping = true;
+                c.DrainRequested = false;
+                ReleaseNative(c);
+            }
+            DateTime captured = DateTime.UtcNow;
+            try
+            {
+                result.ProcessTraffic = c.IncludeOtherProcesses && c.Started && c.ConsumerStarted ? c.ProcessTraffic.GetSnapshot(captured, true) :
+                    new ProcessTrafficSnapshot { TimestampUtc = captured, Available = false, Status = "프로그램별 최종 자료 없음 · 수집 요청/시작 확인 필요" };
+                if (c.IncludeOtherProcesses && !result.ProcessTraffic.Available)
+                { result.Drained = false; result.Status += " · 최종 프로그램 구간 미확인"; }
+            }
+            catch (Exception error)
+            {
+                result.Drained = false; result.Status += " · 최종 프로그램 집계 실패";
+                result.ProcessTraffic = new ProcessTrafficSnapshot { TimestampUtc = captured, Available = false, Status = "최종 집계 실패 · " + error.Message };
+                SetFailure(c, error, "FinalProcessSnapshot");
+            }
+            lock (c.HealthGate)
+            {
+                c.Health.Active = false;
+                c.Health.Status = result.Status;
+                result.Health = Clone(c.Health); CopyDiagnosticCounters(c, result.Health);
+                if (result.Health.EventsLost > 0 || result.Health.BuffersLost > 0 || result.Health.MalformedEvents > 0 || result.Health.UnsupportedEvents > 0)
+                { result.Status += " · 일부 수집 기록 제외됨"; result.Health.Status = result.Status; }
+            }
+            lock (lifecycle)
+            {
+                last = Clone(result.Health);
+                if (Object.ReferenceEquals(current, c) && c.Session == 0) current = null;
+            }
+            return result;
         }
 
         private void StopLocked()
@@ -213,8 +306,10 @@ namespace GameNetworkMonitor
                 lock (c.NativeGate) handle = c.Consumer;
                 if (!c.Stopping && handle != InvalidTrace)
                 {
+                    c.ConsumerStarted = true;
                     uint result = ProcessTrace(new ulong[] { handle }, 1, IntPtr.Zero, IntPtr.Zero);
-                    if (!c.Stopping)
+                    c.ConsumerExitCode = result;
+                    if (!c.Stopping && !c.DrainRequested)
                     {
                         if (result == 0) SetStatus(c, false, "ETW 세션이 종료됨 · 게임 통신 수치 사용 불가");
                         else SetFailure(c, new Win32Exception((int)result), "ProcessTrace");
@@ -223,6 +318,7 @@ namespace GameNetworkMonitor
             }
             catch (Exception ex)
             {
+                c.ConsumerExitCode = UInt32.MaxValue;
                 if (!c.Stopping) SetFailure(c, ex, "ProcessTrace");
             }
             finally
@@ -239,6 +335,9 @@ namespace GameNetworkMonitor
         {
             lock (c.NativeGate)
             {
+                // A graceful stop caller owns the control allocation until its native
+                // STOP call and lock-free consumer wait have both completed.
+                if (c.DrainRequested) return;
                 if (c.Consumer != InvalidTrace)
                 {
                     CloseTrace(c.Consumer);
@@ -315,6 +414,7 @@ namespace GameNetworkMonitor
                 TrafficEvent value = Decode(r.Header.ProviderId, r.Header.Descriptor.Opcode,
                     r.Header.Descriptor.Version, prefix, c.ProcessId, r.Header.Timestamp);
                 if (value == null) { Malformed(c); return; }
+                value.CaptureGeneration = c.CaptureGeneration;
                 Action<TrafficEvent> receiver = EventReceived;
                 if (receiver != null && !c.Stopping)
                 {
@@ -494,6 +594,150 @@ namespace GameNetworkMonitor
                 failure.Health.FailureStage == "ETW 초기화", "managed failure clears native permission diagnostics");
             NativeCallbackFixture(v4, time);
             ProcessTrafficTracker.SelfTest();
+            SyntheticDrainSelfTest();
+        }
+
+        // Managed coordination checks only. Every Context has zero native handles:
+        // these fixtures cannot establish that native ETW STOP/flush succeeds.
+        private static void SyntheticDrainSelfTest()
+        {
+            SyntheticDrainWorkerFixture(false);
+            SyntheticDrainWorkerFixture(true);
+
+            using (KernelNetworkMonitor monitor = new KernelNetworkMonitor())
+            {
+                TraceStopResult result = monitor.StopAndCapture(0);
+                Require(!result.Drained && !result.TimedOut && !result.ProcessTraffic.Available && result.Status.Contains("세션 없음"),
+                    "no context cannot report a completed native drain");
+            }
+            using (KernelNetworkMonitor monitor = new KernelNetworkMonitor())
+            {
+                Context c = new Context { Started = true, ConsumerStarted = false, Finished = true };
+                c.Health.Active = true; monitor.current = c;
+                TraceStopResult result = monitor.StopAndCapture(0);
+                Require(!result.Drained && !result.ProcessTraffic.Available && result.Status.Contains("시작/소비 확인 안 됨"),
+                    "consumer not started cannot report drain completion");
+            }
+            using (KernelNetworkMonitor monitor = new KernelNetworkMonitor())
+            {
+                Context c = new Context { Started = false, Finished = true };
+                SetFailure(c, new Win32Exception(5), "synthetic consumer startup"); monitor.current = c;
+                TraceStopResult result = monitor.StopAndCapture(0);
+                Require(!result.Drained && result.Health.PermissionDenied && !result.ProcessTraffic.Available,
+                    "failed startup cannot report drain completion or lose its failure state");
+            }
+            using (KernelNetworkMonitor monitor = new KernelNetworkMonitor())
+            {
+                Context c = new Context { Started = true, ConsumerStarted = true, ConsumerExitCode = 5, Finished = true };
+                c.Health.Active = true; monitor.current = c;
+                TraceStopResult result = monitor.StopAndCapture(0);
+                Require(!result.Drained && result.ConsumerExitCode == 5 && !result.Health.Active,
+                    "failed synthetic consumer cannot report drain completion");
+            }
+        }
+
+        private static void SyntheticDrainWorkerFixture(bool timeOut)
+        {
+            KernelNetworkMonitor monitor = new KernelNetworkMonitor();
+            Context c = new Context { Started = true, IncludeOtherProcesses = true, ProcessId = Int32.MaxValue };
+            c.Health.Active = true; monitor.current = c;
+            ManualResetEvent ready = new ManualResetEvent(false), release = new ManualResetEvent(false);
+            Exception workerError = null;
+            int callbacks = 0;
+            bool acquiredLocks = false, deliveredDuringDrain = false;
+            monitor.EventReceived += delegate(TrafficEvent value) { Interlocked.Increment(ref callbacks); };
+            Thread worker = new Thread(delegate() {
+                try
+                {
+                    c.ConsumerStarted = true; ready.Set();
+                    if (!release.WaitOne(3000)) throw new InvalidOperationException("synthetic worker release was not signalled");
+                    if (timeOut) return;
+                    if (!SpinWait.SpinUntil(delegate { return c.DrainRequested; }, 2000))
+                        throw new InvalidOperationException("synthetic worker did not observe the drain request");
+                    bool gotLifecycle = false, gotNative = false, gotHealth = false;
+                    try
+                    {
+                        gotLifecycle = Monitor.TryEnter(monitor.lifecycle, 500);
+                        if (gotLifecycle) gotNative = Monitor.TryEnter(c.NativeGate, 500);
+                        if (gotNative) gotHealth = Monitor.TryEnter(c.HealthGate, 500);
+                        acquiredLocks = gotLifecycle && gotNative && gotHealth;
+                    }
+                    finally
+                    {
+                        if (gotHealth) Monitor.Exit(c.HealthGate);
+                        if (gotNative) Monitor.Exit(c.NativeGate);
+                        if (gotLifecycle) Monitor.Exit(monitor.lifecycle);
+                    }
+                    if (!acquiredLocks) throw new InvalidOperationException("consumer wait retained a monitor lock");
+                    deliveredDuringDrain = c.DrainRequested && !c.Stopping;
+                    SyntheticDrainRecord(monitor, c);
+                }
+                catch (Exception error) { workerError = error; c.ConsumerExitCode = UInt32.MaxValue; }
+                finally { c.Finished = true; }
+            });
+            worker.IsBackground = true; worker.Name = "Synthetic ETW drain fixture"; c.Worker = worker;
+            try
+            {
+                Require(c.Session == 0 && c.Properties == IntPtr.Zero && c.Consumer == InvalidTrace,
+                    "synthetic fixture must never own native trace handles");
+                worker.Start();
+                Require(ready.WaitOne(2000), "synthetic consumer did not start");
+                if (!timeOut) release.Set();
+                TraceStopResult result = monitor.StopAndCapture(timeOut ? 0 : 5000);
+                Require(!result.Drained, "no native STOP was issued, so managed worker completion cannot claim a native drain");
+                if (timeOut)
+                {
+                    Require(result.TimedOut && worker.IsAlive && callbacks == 0,
+                        "blocked synthetic consumer must time out without claiming final callbacks");
+                }
+                else
+                {
+                    Require(!result.TimedOut && !worker.IsAlive && workerError == null && acquiredLocks && deliveredDuringDrain,
+                        "stop did not wait outside its locks for a synthetic consumer to finish");
+                    Require(callbacks == 1 && result.ProcessTraffic.Available && result.ProcessTraffic.Rows.Count == 1 &&
+                        result.ProcessTraffic.Rows[0].ProcessId == Int32.MaxValue && result.ProcessTraffic.Rows[0].SentBytesTotal == 512,
+                        "last process bytes delivered during drain were not captured");
+                    Require(!result.Health.Active && c.Stopping,
+                        "synthetic capture did not finish with inactive collection");
+                }
+            }
+            finally
+            {
+                // Every wait is bounded and every started worker is released even when
+                // an assertion fails. Do not dispose its gates while it can still use them.
+                release.Set();
+                bool joined = (worker.ThreadState & ThreadState.Unstarted) != 0 || worker.Join(5000);
+                monitor.Dispose();
+                if (joined) { ready.Close(); release.Close(); }
+                Require(joined, "synthetic consumer cleanup did not finish within its bound");
+            }
+            Require(workerError == null, "synthetic consumer failed during cleanup");
+        }
+
+        private static void SyntheticDrainRecord(KernelNetworkMonitor monitor, Context c)
+        {
+            byte[] prefix = new byte[20];
+            Buffer.BlockCopy(BitConverter.GetBytes(c.ProcessId), 0, prefix, 0, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(512), 0, prefix, 4, 4);
+            IntPtr metadata = Marshal.AllocHGlobal(prefix.Length);
+            IntPtr nativeRecord = IntPtr.Zero;
+            try
+            {
+                nativeRecord = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(EventRecord)));
+                Marshal.Copy(prefix, 0, metadata, prefix.Length);
+                EventRecord record = new EventRecord();
+                record.Header.Size = 80; record.Header.ProviderId = TcpProvider;
+                record.Header.Descriptor.Version = 2; record.Header.Descriptor.Opcode = 10;
+                record.Header.Timestamp = DateTime.UtcNow.ToFileTimeUtc();
+                record.UserDataLength = (ushort)prefix.Length; record.UserData = metadata;
+                Marshal.StructureToPtr(record, nativeRecord, false);
+                monitor.OnRecord(c, nativeRecord);
+            }
+            finally
+            {
+                if (nativeRecord != IntPtr.Zero) Marshal.FreeHGlobal(nativeRecord);
+                Marshal.FreeHGlobal(metadata);
+            }
         }
 
         private static void NativeCallbackFixture(byte[] prefix, long time)

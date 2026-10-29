@@ -9,11 +9,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     public static class App
     {
-        public const string Version = "0.1.8";
+        public const string Version = "0.2.1";
         private static string exitContext = "명시적 종료 요청 미확인";
         private static volatile bool unhandledExceptionSeen;
 
@@ -40,7 +40,7 @@ namespace GameNetworkMonitor
             catch (Exception error) {
                 unhandledExceptionSeen = true;
                 DiagnosticsLog.Write("entry_failure", "main entry failed", error);
-                if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + error.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "게임 네트워크 모니터");
+                if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + error.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "PC 인터넷 모니터");
             }
             finally { DiagnosticsLog.Write("main_return", "exit_code=" + result + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen); }
             return result;
@@ -54,7 +54,7 @@ namespace GameNetworkMonitor
 
         private static bool IsTestMode(string mode)
         {
-            return mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test";
+            return mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test" || mode == "--tcp-rtt-test" || mode == "--internet-test" || mode == "--internet-loopback-test" || mode == "--internet-recording-test";
         }
 
         private static int Run(string[] args)
@@ -68,11 +68,18 @@ namespace GameNetworkMonitor
                     KernelNetworkMonitor.SelfTest(); ProbeRunner.SelfTest(); MonitorController.SelfTest(); StartupSelection.SelfTest();
                     AutomaticSessionLog.SelfTest(testDir); SessionAnalysis.SelfTest(); DiagnosticsLog.SelfTest(testDir); ProgramUsageTotals.SelfTest();
                     ExportTest(testDir);
+                    AdapterCounterTotals.SelfTest(); MeasurementQuality.SelfTest();
+                    FinalSnapshotTests.SelfTest(testDir);
+                    GameCheckPresentation.SelfTest(); TcpRttMonitor.SelfTest(); TcpRttLoggingTests.SelfTest(testDir); TcpRttPresentation.SelfTest();
+                    InternetCheckRunner.SelfTest(); ConnectivityHistory.SelfTest(); InternetLoggingTests.SelfTest(testDir);
                     Directory.CreateDirectory(testDir);
-                    File.WriteAllText(Path.Combine(testDir, "self-test.txt"), "PASS v" + Version + ": ETW/probe/statistics/CSV/selection, persistence/error handling, raw-probe analysis, whole-session program send totals/grouping/duplicate intervals.\r\n", Encoding.UTF8);
+                    File.WriteAllText(Path.Combine(testDir, "self-test.txt"), "PASS v" + Version + ": DNS/HTTPS timeout/cancel/generation/freshness, connectivity failure/recovery/gap/history, CSV dedup/flush/archive/PC summary, retained ETW/probe/adapter/TCP RTT synthetic regression checks. No live network or performance validation in this test.\r\n", Encoding.UTF8);
                     return 0;
                 }
                 if (mode == "--probe-test") { ProbeTest(testDir); return 0; }
+                if (mode == "--tcp-rtt-test") { Directory.CreateDirectory(testDir); TcpRttMonitor.LiveLoopbackTest(Path.Combine(testDir, "tcp-rtt-test.txt")); return 0; }
+                if (mode == "--internet-test") { InternetLiveValidation.Run(testDir); return 0; }
+                if (mode == "--internet-loopback-test") { Directory.CreateDirectory(testDir); InternetCheckRunner.LiveLoopbackTest(Path.Combine(testDir, "internet-loopback-test.txt")); return 0; }
                 Application app = new Application();
                 app.ShutdownMode = ShutdownMode.OnMainWindowClose;
                 app.DispatcherUnhandledException += delegate(object sender, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e) {
@@ -84,7 +91,8 @@ namespace GameNetworkMonitor
                 app.Exit += delegate(object sender, ExitEventArgs e) {
                     DiagnosticsLog.Write("application_exit", "exit_code=" + e.ApplicationExitCode + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
                 };
-                MainWindow window = mode == "--recording-test" ? new MainWindow(null, Path.Combine(testDir, "recording-fixture-" + Guid.NewGuid().ToString("N"))) : new MainWindow(StartupSelection.FromArgs(args));
+                MainWindow window = mode == "--recording-test" || mode == "--smoke-test" || mode == "--internet-recording-test" ? new MainWindow(null, Path.Combine(testDir, "internet-ui-fixture-" + Guid.NewGuid().ToString("N"))) : new MainWindow(StartupSelection.FromArgs(args));
+                if (mode == "--internet-recording-test") { window.InternetRecordingTest(Path.Combine(testDir, "internet-recording-test.txt")); window.Close(); app.Shutdown(); return 0; }
                 if (mode == "--lifecycle-test")
                 {
                     // Enter the actual WPF dispatcher, then close only this idle test window.
@@ -104,7 +112,7 @@ namespace GameNetworkMonitor
                     Directory.CreateDirectory(testDir);
                     window.SmokeTest(Path.Combine(testDir, "dashboard.png"));
                     window.Close();
-                    File.WriteAllText(Path.Combine(testDir, "smoke-test.txt"), "PASS v" + Version + ": WPF summary, two tabs, program cumulative totals, permission state and selection restoration; no live ETW, probes or UAC.\r\n", Encoding.UTF8);
+                    File.WriteAllText(Path.Combine(testDir, "smoke-test.txt"), "PASS v" + Version + ": PC internet dashboard, four checks, DNS/HTTPS success/failure/stale/stopped, persistent history merge, fixed connection controls and scrollable history. Synthetic UI only, no network or UAC.\r\n", Encoding.UTF8);
                     app.Shutdown(); return 0;
                 }
                 return app.Run(window);
@@ -115,7 +123,7 @@ namespace GameNetworkMonitor
                 DiagnosticsLog.Write("main_exception", "application startup or dispatch failed", e);
                 try { Directory.CreateDirectory(testDir); File.WriteAllText(Path.Combine(testDir, "last-error.txt"), e.ToString(), Encoding.UTF8); }
                 catch (Exception writeError) { DiagnosticsLog.Write("legacy_error_write_failed", "could not write test error file", writeError); }
-                if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + e.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "게임 네트워크 모니터");
+                if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + e.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "PC 인터넷 모니터");
                 return 1;
             }
         }
@@ -170,7 +178,7 @@ namespace GameNetworkMonitor
                         IPEndPoint endpoint = (IPEndPoint)receiver.Client.LocalEndPoint;
                         for (int i = 0; i < 10; i++)
                         {
-                            byte[] data = Encoding.ASCII.GetBytes("GameNetworkMonitor local fixture");
+                            byte[] data = Encoding.ASCII.GetBytes("PcInternetMonitor local fixture");
                             sender.Send(data, data.Length, endpoint);
                             IPEndPoint peer = null; receiver.Receive(ref peer); Thread.Sleep(30);
                         }

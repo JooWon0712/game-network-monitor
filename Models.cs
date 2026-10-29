@@ -1,13 +1,14 @@
 using System;
 using System.Collections.Generic;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     public sealed class TrafficEvent
     {
         public DateTime TimestampUtc;
         public DateTime ObservedUtc;
         public int ProcessId;
+        public long CaptureGeneration;
         public string Protocol;
         public bool IsSend;
         public bool IsRetransmit;
@@ -31,6 +32,18 @@ namespace GameNetworkMonitor
         public long CandidateEvents;
         public long SelectedPidEvents;
         public long UnsupportedEvents;
+    }
+
+    public sealed class TraceStopResult
+    {
+        public TraceHealth Health = new TraceHealth();
+        public ProcessTrafficSnapshot ProcessTraffic = new ProcessTrafficSnapshot();
+        public bool Drained;
+        public DateTime RequestedUtc;
+        public string Status;
+        public uint StopNativeCode;
+        public uint ConsumerExitCode;
+        public bool TimedOut;
     }
 
     public sealed class AdapterInfo
@@ -93,6 +106,10 @@ namespace GameNetworkMonitor
         public int Sent;
         public int Missing;
         public int Errors;
+        public DateTime? LastSampleUtc;
+        public bool CurrentError;
+        public bool CurrentTimedOut;
+        public bool Stale;
     }
 
     public sealed class MonitorSnapshot
@@ -105,7 +122,16 @@ namespace GameNetworkMonitor
         public TraceHealth Trace = new TraceHealth();
         public bool GameRatesAvailable;
         public bool GameCollectionRequested;
+        public TcpRttSnapshot TcpRtt = new TcpRttSnapshot();
         public bool ProcessCollectionRequested;
+        public bool GameProcessEnded;
+        public bool AdapterExpected;
+        public long AdapterCounterResets;
+        public long AdapterCounterGaps;
+        public bool IsFinal;
+        public bool StopDrainComplete;
+        public string StopBoundaryStatus;
+        public DateTime? StopRequestedUtc;
         public double GameSentBytesPerSecond;
         public double GameReceivedBytesPerSecond;
         public double GameSentEventsPerSecond;

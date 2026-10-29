@@ -6,7 +6,7 @@ using System.IO;
 using System.Text;
 using System.Threading;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     // Only writes rows supplied by an active window. No timer, service, or network access.
     public sealed class AutomaticSessionLog : IDisposable
@@ -15,19 +15,26 @@ namespace GameNetworkMonitor
         private const int MaximumQueuedRows = 4096;
         private const int MaximumQueuedCharacters = 16 * 1024 * 1024;
         private const string ProbeHeader = "timestamp_utc,timestamp_local,kind,target,status,rtt_ms,countable,timed_out";
+        internal const string TcpRttHeader = "snapshot_utc,rtt_snapshot_utc,pid,process,requested,state,status,available,permission_denied,stale,partial,connections_found,connections_tracked,connections_measured,connections_skipped,minimum_smoothed_rtt_ms,maximum_smoothed_rtt_ms,native_error_code,error_stage,connection_key,address_family,local,remote,connection_created_timestamp,connection_available,collection_enabled,collection_owned,last_sample_utc,smoothed_rtt_ms,sample_rtt_ms,rtt_samples_total,rtt_samples_delta,connection_error_code,connection_status,actual_game_ping_support,game_packet_loss_support";
+        internal const string InternetCheckHeader = "started_utc,completed_utc,completed_local,kind,target,state,status,success,timed_out,cancelled,duration_ms,http_status,error";
+        internal const string ConnectivityIncidentHeader = "id,version,kind,target,category,scope,state,first_failed_check_utc,last_observed_utc,recovered_utc,observation_closed_utc,duration_seconds,failed_checks,summary,end_reason";
         private readonly object gate = new object();
         private readonly Queue<PendingRow> pending = new Queue<PendingRow>();
         // Retain only the previous observed endpoint set for change detection.
         // TrafficWindow supplies at most 512 endpoints; this is not a packet capture.
         private Dictionary<string, string> previousEndpoints = new Dictionary<string, string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, DateTime> lastInternetChecks = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        private readonly Dictionary<string, long> lastIncidentVersions = new Dictionary<string, long>(StringComparer.Ordinal);
+        private readonly Queue<string> incidentIdentityOrder = new Queue<string>();
         private readonly AutoResetEvent wake = new AutoResetEvent(false);
         private readonly Thread worker;
         private readonly DateTime startedUtc = DateTime.UtcNow;
-        private StreamWriter samples, marks, probes, processes, endpoints, metadata;
+        private StreamWriter samples, marks, probes, processes, endpoints, tcpRtt, internetChecks, connectivityIncidents, metadata;
         private bool healthy = true, completing, disposed;
         private string errorMessage = "", completionReason = "측정 종료";
-        private long acceptedSamples, writtenSamples, writtenMarks, writtenProbes, writtenProcessRows, writtenEndpointRows;
-        private DateTime lastProcessTimestamp;
+        private long acceptedSamples, writtenSamples, writtenMarks, writtenProbes, writtenProcessRows, writtenEndpointRows, writtenTcpRttRows;
+        private long writtenInternetChecks, writtenConnectivityIncidents;
+        private DateTime lastProcessTimestamp, lastTcpRttTimestamp;
         private long queuedCharacters;
 
         public string SessionDirectory { get; private set; }
@@ -59,13 +66,19 @@ namespace GameNetworkMonitor
                 probes = CreateWriter(Path.Combine(SessionDirectory, "probes.csv"));
                 processes = CreateWriter(Path.Combine(SessionDirectory, "process-traffic.csv"));
                 endpoints = CreateWriter(Path.Combine(SessionDirectory, "game-endpoints.csv"));
+                tcpRtt = CreateWriter(Path.Combine(SessionDirectory, "tcp-rtt.csv"));
+                internetChecks = CreateWriter(Path.Combine(SessionDirectory, "internet-checks.csv"));
+                connectivityIncidents = CreateWriter(Path.Combine(SessionDirectory, "connectivity-incidents.csv"));
                 metadata = CreateWriter(Path.Combine(SessionDirectory, "session.txt"));
                 samples.WriteLine(SessionLog.CsvHeader);
                 marks.WriteLine("timestamp_local,label");
                 probes.WriteLine(ProbeHeader);
                 processes.WriteLine("timestamp_utc,interval_start_utc,interval_end_utc,interval_seconds,pid,process,process_instance,identity_available,send_bytes_s,receive_bytes_s,send_bytes_total,receive_bytes_total,scope");
                 endpoints.WriteLine("timestamp_utc,timestamp_local,process,pid,protocol,local,remote,send_bytes_total,receive_bytes_total,send_events_total,receive_events_total,tcp_retransmit_events_total,last_seen_utc");
-                metadata.WriteLine("format_version=3");
+                tcpRtt.WriteLine(TcpRttHeader);
+                internetChecks.WriteLine(InternetCheckHeader);
+                connectivityIncidents.WriteLine(ConnectivityIncidentHeader);
+                metadata.WriteLine("format_version=5");
                 metadata.WriteLine("started_utc=" + startedUtc.ToString("o", CultureInfo.InvariantCulture));
                 metadata.WriteLine("started_local=" + startedUtc.ToLocalTime().ToString("o", CultureInfo.InvariantCulture));
                 metadata.WriteLine("state=recording");
@@ -73,6 +86,11 @@ namespace GameNetworkMonitor
                 metadata.WriteLine("timestamps=ISO-8601; sample cadence is controlled by the monitor window");
                 metadata.WriteLine("privacy=local files only; packet payloads are not stored");
                 metadata.WriteLine("endpoint_scope=selected game; changed cumulative snapshots, not individual packets; observed endpoint retention limit 512");
+                metadata.WriteLine("tcp_rtt_scope=selected process TCP connections; Windows smoothed RTT; cached collector timestamps are stored once; not actual game server ping or packet loss");
+                metadata.WriteLine("internet_check_scope=individual configured DNS/HTTPS targets; system routing/proxy apply; failed target check is not proof of whole Internet or ISP outage");
+                metadata.WriteLine("incident_scope=observed check failures and local connection state; first_failed_check is an observation, not the exact physical outage start; observation_closed is not recovered");
+                metadata.WriteLine("internet_check_dedup=monotonic completion timestamp per kind/target; at most 64 distinct target keys");
+                metadata.WriteLine("incident_dedup=monotonic version for most recent 4096 incident identities");
                 FlushAll();
                 worker = new Thread(WriteLoop);
                 worker.IsBackground = true;
@@ -83,7 +101,7 @@ namespace GameNetworkMonitor
             catch
             {
                 // Preserve any partial files for diagnosis instead of deleting user data.
-                CloseWriter(ref samples); CloseWriter(ref marks); CloseWriter(ref probes); CloseWriter(ref processes); CloseWriter(ref endpoints); CloseWriter(ref metadata);
+                CloseWriter(ref samples); CloseWriter(ref marks); CloseWriter(ref probes); CloseWriter(ref processes); CloseWriter(ref endpoints); CloseWriter(ref tcpRtt); CloseWriter(ref internetChecks); CloseWriter(ref connectivityIncidents); CloseWriter(ref metadata);
                 wake.Dispose();
                 throw;
             }
@@ -99,6 +117,8 @@ namespace GameNetworkMonitor
             if (snapshot == null) throw new ArgumentNullException("snapshot");
             // Serialize before enqueueing so later UI mutations cannot change the stored sample.
             string sampleText = SessionLog.ToCsvRow(snapshot);
+            int tcpRttCount;
+            string tcpRttText = SerializeTcpRtt(snapshot, out tcpRttCount);
             ProcessTrafficSnapshot p = snapshot.ProcessTraffic;
             StringBuilder batch = new StringBuilder();
             if (p != null && p.Available && p.IntervalSeconds > 0)
@@ -112,6 +132,7 @@ namespace GameNetworkMonitor
             lock (gate)
             {
                 bool writeProcesses = batch.Length > 0 && p.TimestampUtc > lastProcessTimestamp;
+                bool writeTcpRtt = tcpRttCount > 0 && snapshot.TcpRtt.TimestampUtc > lastTcpRttTimestamp;
                 if (!healthy || completing || disposed) return false;
                 Dictionary<string, string> nextEndpoints = null;
                 StringBuilder endpointBatch = new StringBuilder();
@@ -139,8 +160,8 @@ namespace GameNetworkMonitor
                         nextEndpoints[key] = value;
                     }
                 }
-                long addedCharacters = (long)sampleText.Length + (writeProcesses ? batch.Length : 0) + endpointBatch.Length;
-                if (pending.Count + 1 + (writeProcesses ? 1 : 0) + (endpointCount > 0 ? 1 : 0) > MaximumQueuedRows || queuedCharacters + addedCharacters > MaximumQueuedCharacters)
+                long addedCharacters = (long)sampleText.Length + (writeProcesses ? batch.Length : 0) + endpointBatch.Length + (writeTcpRtt ? tcpRttText.Length : 0);
+                if (pending.Count + 1 + (writeProcesses ? 1 : 0) + (endpointCount > 0 ? 1 : 0) + (writeTcpRtt ? 1 : 0) > MaximumQueuedRows || queuedCharacters + addedCharacters > MaximumQueuedCharacters)
                 { FailLocked("디스크 기록 대기열이 가득 찼습니다. 이후 데이터는 자동 저장되지 않습니다."); return false; }
                 QueueLocked(new PendingRow { Kind = 0, Text = sampleText }); acceptedSamples++;
                 if (writeProcesses)
@@ -148,10 +169,128 @@ namespace GameNetworkMonitor
                     QueueLocked(new PendingRow { Kind = 3, Text = batch.ToString(), Count = p.Rows.Count }); lastProcessTimestamp = p.TimestampUtc;
                 }
                 if (endpointCount > 0) QueueLocked(new PendingRow { Kind = 4, Text = endpointBatch.ToString(), Count = endpointCount });
+                if (writeTcpRtt)
+                {
+                    QueueLocked(new PendingRow { Kind = 5, Text = tcpRttText, Count = tcpRttCount });
+                    lastTcpRttTimestamp = snapshot.TcpRtt.TimestampUtc;
+                }
                 if (nextEndpoints != null) previousEndpoints = nextEndpoints;
                 wake.Set(); return true;
             }
         }
+
+        private static string SerializeTcpRtt(MonitorSnapshot snapshot, out int count)
+        {
+            count = 0;
+            TcpRttSnapshot value = snapshot.TcpRtt;
+            if (value == null || snapshot.ProcessId <= 0 || value.TimestampUtc == DateTime.MinValue) return "";
+            bool sameProcess = value.ProcessId == snapshot.ProcessId;
+            bool available = sameProcess && value.Available && !value.Stale;
+            string[] prefix = new string[] {
+                snapshot.TimestampUtc.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture), value.TimestampUtc.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                snapshot.ProcessId.ToString(CultureInfo.InvariantCulture), SessionLog.Csv(snapshot.ProcessName), value.Requested ? "true" : "false",
+                SessionLog.Csv(sameProcess ? value.State : "pid_mismatch"), SessionLog.Csv(sameProcess ? value.Status : "선택한 PID와 TCP RTT 자료가 다름"),
+                available ? "true" : "false", value.PermissionDenied ? "true" : "false", value.Stale ? "true" : "false", value.Partial ? "true" : "false",
+                value.ConnectionsFound.ToString(CultureInfo.InvariantCulture), value.ConnectionsTracked.ToString(CultureInfo.InvariantCulture),
+                value.ConnectionsMeasured.ToString(CultureInfo.InvariantCulture), value.ConnectionsSkipped.ToString(CultureInfo.InvariantCulture),
+                RttNumber(available ? value.MinimumMs : null), RttNumber(available ? value.MaximumMs : null),
+                value.NativeErrorCode.ToString(CultureInfo.InvariantCulture), SessionLog.Csv(value.ErrorStage)
+            };
+            StringBuilder rows = new StringBuilder();
+            if (sameProcess && value.Connections != null)
+                foreach (TcpRttConnection connection in value.Connections)
+                {
+                    if (connection == null) continue;
+                    bool measured = available && connection.Available && connection.CollectionEnabled;
+                    rows.AppendLine(String.Join(",", prefix) + "," + String.Join(",", new string[] {
+                        SessionLog.Csv(connection.Key), SessionLog.Csv(connection.AddressFamily), SessionLog.Csv(connection.Local), SessionLog.Csv(connection.Remote),
+                        connection.CreationTimestamp.ToString(CultureInfo.InvariantCulture), measured ? "true" : "false",
+                        connection.CollectionEnabled ? "true" : "false", connection.CollectionOwned ? "true" : "false",
+                        connection.LastSampleUtc.HasValue ? connection.LastSampleUtc.Value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) : "",
+                        RttNumber(measured ? connection.SmoothedRttMs : null), RttNumber(measured ? connection.SampleRttMs : null),
+                        connection.SamplesTotal.ToString(CultureInfo.InvariantCulture), connection.SamplesDelta.ToString(CultureInfo.InvariantCulture),
+                        connection.NativeErrorCode.ToString(CultureInfo.InvariantCulture), SessionLog.Csv(connection.Status), "unsupported", "unsupported"
+                    }));
+                    count++;
+                }
+            if (count == 0)
+            {
+                // A state row is evidence of unavailability; it is never a measured zero RTT.
+                rows.AppendLine(String.Join(",", prefix) + "," + String.Join(",", new string[] {
+                    "", "", "", "", "", "false", "false", "false", "", "", "", "", "", "", "", "unsupported", "unsupported"
+                }));
+                count = 1;
+            }
+            return rows.ToString();
+        }
+
+        private static string RttNumber(double? value)
+        {
+            return value.HasValue && !Double.IsNaN(value.Value) && !Double.IsInfinity(value.Value) && value.Value >= 0 ? value.Value.ToString("0.###", CultureInfo.InvariantCulture) : "";
+        }
+
+        public bool AppendInternetCheck(InternetCheckSample sample)
+        {
+            if (sample == null) throw new ArgumentNullException("sample");
+            // Copy values to a row before enqueueing; callers can reuse their snapshots.
+            string key = (sample.Kind ?? "") + "\n" + (sample.Target ?? "");
+            DateTime timestamp = sample.TimestampUtc;
+            string text = String.Join(",", new string[] {
+                Utc(sample.StartedUtc), Utc(timestamp), timestamp == DateTime.MinValue ? "" : timestamp.ToLocalTime().ToString("o", CultureInfo.InvariantCulture),
+                SessionLog.Csv(sample.Kind), SessionLog.Csv(sample.Target), SessionLog.Csv(sample.State), SessionLog.Csv(sample.Status),
+                sample.Success ? "true" : "false", sample.TimedOut ? "true" : "false", sample.Cancelled ? "true" : "false",
+                RttNumber(sample.DurationMs), sample.HttpStatusCode.HasValue ? sample.HttpStatusCode.Value.ToString(CultureInfo.InvariantCulture) : "", SessionLog.Csv(sample.Error)
+            });
+            lock (gate)
+            {
+                if (!healthy || completing || disposed) return false;
+                DateTime previous;
+                if (timestamp == DateTime.MinValue || (lastInternetChecks.TryGetValue(key, out previous) && timestamp <= previous)) return true;
+                if (!lastInternetChecks.ContainsKey(key) && lastInternetChecks.Count >= 64)
+                { FailLocked("인터넷 검사 대상 식별 한도를 초과했습니다. 이후 데이터는 자동 저장되지 않습니다."); return false; }
+                if (!QueueSingleLocked(6, text)) return false;
+                lastInternetChecks[key] = timestamp;
+                return true;
+            }
+        }
+
+        public bool AppendConnectivityIncident(ConnectivityIncident incident)
+        {
+            if (incident == null) throw new ArgumentNullException("incident");
+            string id = incident.Id ?? ""; long version = incident.Version;
+            string text = String.Join(",", new string[] {
+                SessionLog.Csv(id), version.ToString(CultureInfo.InvariantCulture), SessionLog.Csv(incident.Kind), SessionLog.Csv(incident.Target),
+                SessionLog.Csv(incident.Category), SessionLog.Csv(incident.Scope), SessionLog.Csv(incident.State),
+                Utc(incident.StartedUtc), Utc(incident.LastObservedUtc), OptionalUtc(incident.RecoveredUtc), OptionalUtc(incident.ClosedUtc),
+                RttNumber(incident.DurationSeconds), incident.Failures.ToString(CultureInfo.InvariantCulture), SessionLog.Csv(incident.Summary), SessionLog.Csv(incident.EndReason)
+            });
+            lock (gate)
+            {
+                if (!healthy || completing || disposed) return false;
+                if (id.Length == 0 || version <= 0) return true;
+                long previous;
+                if (lastIncidentVersions.TryGetValue(id, out previous) && version <= previous) return true;
+                if (!QueueSingleLocked(7, text)) return false;
+                if (!lastIncidentVersions.ContainsKey(id))
+                {
+                    while (incidentIdentityOrder.Count >= 4096) lastIncidentVersions.Remove(incidentIdentityOrder.Dequeue());
+                    incidentIdentityOrder.Enqueue(id);
+                }
+                lastIncidentVersions[id] = version;
+                return true;
+            }
+        }
+
+        private bool QueueSingleLocked(int kind, string text)
+        {
+            if (pending.Count >= MaximumQueuedRows || queuedCharacters + text.Length > MaximumQueuedCharacters)
+            { FailLocked("디스크 기록 대기열이 가득 찼습니다. 이후 데이터는 자동 저장되지 않습니다."); return false; }
+            QueueLocked(new PendingRow { Kind = kind, Text = text, Count = 1 });
+            wake.Set(); return true;
+        }
+
+        private static string Utc(DateTime value) { return value == DateTime.MinValue ? "" : value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture); }
+        private static string OptionalUtc(DateTime? value) { return value.HasValue ? Utc(value.Value) : ""; }
 
         public bool Mark(DateTime timestampUtc, string label)
         {
@@ -214,6 +353,9 @@ namespace GameNetworkMonitor
                         else if (row.Kind == 2) { probes.WriteLine(row.Text); writtenProbes++; }
                         else if (row.Kind == 3) { processes.Write(row.Text); writtenProcessRows += row.Count; }
                         else if (row.Kind == 4) { endpoints.Write(row.Text); writtenEndpointRows += row.Count; }
+                        else if (row.Kind == 5) { tcpRtt.Write(row.Text); writtenTcpRttRows += row.Count; }
+                        else if (row.Kind == 6) { internetChecks.WriteLine(row.Text); writtenInternetChecks++; }
+                        else if (row.Kind == 7) { connectivityIncidents.WriteLine(row.Text); writtenConnectivityIncidents++; }
                     }
                     if (flushClock.ElapsedMilliseconds >= 1000)
                     {
@@ -226,7 +368,7 @@ namespace GameNetworkMonitor
             catch (Exception ex) { Fail("자동 기록에 실패했습니다: " + ex.Message); }
             finally
             {
-                CloseWriter(ref samples); CloseWriter(ref marks); CloseWriter(ref probes); CloseWriter(ref processes); CloseWriter(ref endpoints);
+                CloseWriter(ref samples); CloseWriter(ref marks); CloseWriter(ref probes); CloseWriter(ref processes); CloseWriter(ref endpoints); CloseWriter(ref tcpRtt); CloseWriter(ref internetChecks); CloseWriter(ref connectivityIncidents);
                 try
                 {
                     metadata.WriteLine("ended_utc=" + DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
@@ -237,6 +379,9 @@ namespace GameNetworkMonitor
                     metadata.WriteLine("probes_written=" + writtenProbes.ToString(CultureInfo.InvariantCulture));
                     metadata.WriteLine("process_rows_written=" + writtenProcessRows.ToString(CultureInfo.InvariantCulture));
                     metadata.WriteLine("endpoint_rows_written=" + writtenEndpointRows.ToString(CultureInfo.InvariantCulture));
+                    metadata.WriteLine("tcp_rtt_rows_written=" + writtenTcpRttRows.ToString(CultureInfo.InvariantCulture));
+                    metadata.WriteLine("internet_checks_written=" + writtenInternetChecks.ToString(CultureInfo.InvariantCulture));
+                    metadata.WriteLine("connectivity_incident_versions_written=" + writtenConnectivityIncidents.ToString(CultureInfo.InvariantCulture));
                     metadata.WriteLine("state=" + (IsHealthy ? "completed" : "error"));
                     metadata.WriteLine("error=" + SingleLine(ErrorMessage));
                     metadata.Flush();
@@ -247,7 +392,7 @@ namespace GameNetworkMonitor
         }
 
         private static string SingleLine(string value) { return (value ?? "").Replace("\r", " ").Replace("\n", " "); }
-        private void FlushAll() { samples.Flush(); marks.Flush(); probes.Flush(); processes.Flush(); endpoints.Flush(); metadata.Flush(); }
+        private void FlushAll() { samples.Flush(); marks.Flush(); probes.Flush(); processes.Flush(); endpoints.Flush(); tcpRtt.Flush(); internetChecks.Flush(); connectivityIncidents.Flush(); metadata.Flush(); }
         private void Fail(string message) { lock (gate) FailLocked(message); }
         private void FailLocked(string message)
         {
@@ -371,7 +516,7 @@ namespace GameNetworkMonitor
                 // Only this test's exact files and empty directories are removed, never recursively.
                 foreach (string dir in sessionDirs)
                 {
-                    foreach (string name in new string[] { "samples.csv", "marks.csv", "probes.csv", "process-traffic.csv", "game-endpoints.csv", "session.txt" })
+                    foreach (string name in new string[] { "samples.csv", "marks.csv", "probes.csv", "process-traffic.csv", "game-endpoints.csv", "tcp-rtt.csv", "internet-checks.csv", "connectivity-incidents.csv", "session.txt" })
                     {
                         string path = Path.Combine(dir, name); if (File.Exists(path)) File.Delete(path);
                     }

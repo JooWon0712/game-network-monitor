@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     public sealed class ProcessTrafficRow
     {
@@ -128,12 +128,20 @@ namespace GameNetworkMonitor
 
         public ProcessTrafficSnapshot GetSnapshot(DateTime now)
         {
+            return GetSnapshot(now, false);
+        }
+
+        public ProcessTrafficSnapshot GetSnapshot(DateTime now, bool forcePartial)
+        {
             now = now.Kind == DateTimeKind.Utc ? now : now.ToUniversalTime();
             lock (snapshotGate)
             {
                 DateTime intervalStart = previousSampleUtc;
                 double seconds = (now - intervalStart).TotalSeconds;
-                if (seconds >= 0 && seconds < 1)
+                if (forcePartial && seconds <= 0)
+                    return new ProcessTrafficSnapshot { TimestampUtc = now, Available = false,
+                        Status = "종료 부분 구간 시각이 겹치거나 역행함 · 최종 구간 미확인", DroppedProcessEvents = DroppedEvents() };
+                if (!forcePartial && seconds >= 0 && seconds < 1)
                 {
                     if (previousSnapshot != null) return Clone(previousSnapshot);
                     return new ProcessTrafficSnapshot { TimestampUtc = now, Available = false,

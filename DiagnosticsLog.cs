@@ -4,7 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     // Low-frequency application/session events only. This is not a sample logger.
     public static class DiagnosticsLog

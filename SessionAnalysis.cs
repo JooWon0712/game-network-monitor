@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 
-namespace GameNetworkMonitor
+namespace PcInternetMonitor
 {
     // Detached presentation snapshots. Mutating a returned list cannot change the observer.
     public sealed class AnalysisProbeOverview
@@ -12,6 +12,7 @@ namespace GameNetworkMonitor
         public long Total { get; internal set; }
         public long Successes { get; internal set; }
         public long Timeouts { get; internal set; }
+        public long MaximumTimeoutStreak { get; internal set; }
         public long Errors { get; internal set; }
         public long HighResponses { get; internal set; }
         public double? AverageMs { get; internal set; }
@@ -33,6 +34,8 @@ namespace GameNetworkMonitor
     public sealed class AnalysisOverview
     {
         public long Samples { get; internal set; }
+        public long RunningSamples { get; internal set; }
+        public long FinalSamples { get; internal set; }
         public long GameAvailableSamples { get; internal set; }
         public long DeliveryDelaySamples { get; internal set; }
         public double? MaxDeliveryLagMs { get; internal set; }
@@ -74,7 +77,13 @@ namespace GameNetworkMonitor
         private DateTime firstAt = DateTime.MinValue;
         private DateTime lastAt = DateTime.MinValue;
         private DateTime lastSnapshotAt = DateTime.MinValue;
+        private DateTime lastRunningSnapshotAt = DateTime.MinValue;
+        private DateTime lastProcessTrafficAt = DateTime.MinValue, lastProcessIntervalEndAt = DateTime.MinValue;
         private long snapshots, runningSnapshots, selectedSnapshots, activeSnapshots, gameAvailableSnapshots;
+        private long finalSnapshots, finalProcessTrafficSnapshots, adapterCounterResets, adapterCounterGaps;
+        private bool finalDrainComplete;
+        private string finalBoundaryStatus;
+        private DateTime? finalStopRequestedUtc;
         private long waitingSnapshots, inactiveSnapshots, adapterAvailableSnapshots, snapshotGaps, ignoredSnapshots;
         private long requestedSnapshots, disabledSnapshots, deliveryMissingSnapshots, deliveryDelaySnapshots;
         private long processTrafficAvailableSnapshots, adapterRateSnapshots, highSendSnapshots, highSendAndRttSnapshots, highSendAndRttProbes;
@@ -85,13 +94,18 @@ namespace GameNetworkMonitor
         private double maximumSnapshotGap;
         private string gameName;
         private int gamePid;
+        private long tcpRttRequestedSnapshots, tcpRttAvailableSnapshots, tcpRttUnavailableSnapshots, tcpRttPermissionSnapshots, tcpRttPartialSnapshots;
+        private double tcpRttMinimumMs = Double.MaxValue, tcpRttMaximumMs;
+        private bool tcpRttObserved;
+        private string tcpRttLastStatus;
 
         public AnalysisOverview GetOverview()
         {
             lock (gate)
             {
                 AnalysisOverview result = new AnalysisOverview {
-                    Samples = snapshots, GameAvailableSamples = gameAvailableSnapshots,
+                    Samples = snapshots, RunningSamples = runningSnapshots, FinalSamples = finalSnapshots,
+                    GameAvailableSamples = gameAvailableSnapshots,
                     DeliveryDelaySamples = deliveryDelaySnapshots,
                     MaxDeliveryLagMs = deliveryLagObserved ? (double?)maximumDeliveryLag : null,
                     Gateway = ProbeOverview(gateway), Reference = ProbeOverview(reference),
@@ -128,7 +142,7 @@ namespace GameNetworkMonitor
         {
             return new AnalysisProbeOverview {
                 Target = statistics.Target ?? "", Total = statistics.Total,
-                Successes = statistics.Successes, Timeouts = statistics.Timeouts,
+                Successes = statistics.Successes, Timeouts = statistics.Timeouts, MaximumTimeoutStreak = statistics.MaximumTimeoutStreak,
                 Errors = statistics.Errors, HighResponses = statistics.HighResponses,
                 AverageMs = statistics.Successes > 0 ? (double?)(statistics.Sum / statistics.Successes) : null,
                 MaximumMs = statistics.Successes > 0 ? (double?)statistics.Maximum : null,
@@ -145,36 +159,38 @@ namespace GameNetworkMonitor
                 if (now == DateTime.MinValue || (lastSnapshotAt != DateTime.MinValue && now <= lastSnapshotAt))
                 { ignoredSnapshots++; return; }
                 Touch(now);
-                if (lastSnapshotAt != DateTime.MinValue)
+                lastSnapshotAt = now;
+                snapshots++;
+                if (!snapshot.Running)
                 {
-                    double gap = (now - lastSnapshotAt).TotalSeconds;
+                    if (snapshot.IsFinal) ObserveFinal(snapshot);
+                    return;
+                }
+
+                // Final captures extend the recorded range, but are not polling intervals.
+                // Compare only running samples for gaps and all availability denominators.
+                if (lastRunningSnapshotAt != DateTime.MinValue)
+                {
+                    double gap = (now - lastRunningSnapshotAt).TotalSeconds;
                     maximumSnapshotGap = Math.Max(maximumSnapshotGap, gap);
                     if (gap >= 3)
                     {
                         snapshotGaps++;
-                        AddCandidate("snapshot-gap", lastSnapshotAt, now, "기록 표본 공백", "표본 간격 " + Number(gap) + "초 · 이 사이 상태는 알 수 없음");
+                        AddCandidate("snapshot-gap", lastRunningSnapshotAt, now, "기록 표본 공백", "표본 간격 " + Number(gap) + "초 · 이 사이 상태는 알 수 없음");
                     }
                 }
-                lastSnapshotAt = now;
-                snapshots++;
-                if (!snapshot.Running) return;
+                lastRunningSnapshotAt = now;
                 runningSnapshots++;
+                ObserveTcpRtt(snapshot);
+                ObserveAdapterContinuity(snapshot);
                 if (snapshot.AdapterCountersAvailable)
                 {
                     adapterAvailableSnapshots++;
-                    long beforeReceiveErrors = receiveErrors.Increase, beforeSendErrors = sendErrors.Increase;
-                    long beforeReceiveDiscards = receiveDiscards.Increase, beforeSendDiscards = sendDiscards.Increase;
-                    receiveErrors.Observe(snapshot.AdapterReceiveErrors);
-                    sendErrors.Observe(snapshot.AdapterSendErrors);
-                    receiveDiscards.Observe(snapshot.AdapterReceiveDiscards);
-                    sendDiscards.Observe(snapshot.AdapterSendDiscards);
-                    if (receiveErrors.Increase > beforeReceiveErrors || sendErrors.Increase > beforeSendErrors ||
-                        receiveDiscards.Increase > beforeReceiveDiscards || sendDiscards.Increase > beforeSendDiscards)
-                        AddCandidate("adapter-counters", now, now, "PC 어댑터 오류·폐기 증가", "선택한 어댑터 전체 프로그램의 통계 · 게임 손실로 단정할 수 없음");
+                    ObserveAdapterCounters(snapshot, true);
                 }
                 else AddCandidate("adapter-unavailable", now, now, "PC 어댑터 수집 불가", Clean(snapshot.AdapterStatus));
 
-                ObserveProcessTraffic(snapshot);
+                ObserveProcessTraffic(snapshot, false);
                 if (snapshot.AdapterRatesAvailable && ValidNumber(snapshot.AdapterSentBytesPerSecond))
                 {
                     adapterRateSnapshots++;
@@ -266,6 +282,64 @@ namespace GameNetworkMonitor
             }
         }
 
+        private void ObserveFinal(MonitorSnapshot snapshot)
+        {
+            // Stop/drain deliberately makes ETW inactive. Preserve its final counters
+            // without turning that state into a running sample or synthesizing Active.
+            finalSnapshots++;
+            finalDrainComplete = snapshot.StopDrainComplete;
+            finalBoundaryStatus = Clean(snapshot.StopBoundaryStatus);
+            finalStopRequestedUtc = snapshot.StopRequestedUtc;
+            ObserveAdapterContinuity(snapshot);
+            if (snapshot.AdapterCountersAvailable) ObserveAdapterCounters(snapshot, false);
+            if (snapshot.ProcessId > 0 && snapshot.GameCollectionRequested) retransmits.Observe(snapshot.RetransmitEvents);
+            if (snapshot.Trace != null && (snapshot.GameCollectionRequested || snapshot.ProcessCollectionRequested))
+            {
+                traceEventsLost.Observe(snapshot.Trace.EventsLost);
+                traceBuffersLost.Observe(snapshot.Trace.BuffersLost);
+            }
+            ObserveProcessTraffic(snapshot, true);
+        }
+
+        private void ObserveTcpRtt(MonitorSnapshot snapshot)
+        {
+            TcpRttSnapshot value = snapshot.TcpRtt;
+            if (value == null || !value.Requested || snapshot.ProcessId <= 0 || value.ProcessId != snapshot.ProcessId) return;
+            tcpRttRequestedSnapshots++;
+            if (value.PermissionDenied) tcpRttPermissionSnapshots++;
+            if (value.Partial) tcpRttPartialSnapshots++;
+            tcpRttLastStatus = Clean(value.Status);
+            double age = (snapshot.TimestampUtc - value.TimestampUtc).TotalSeconds;
+            bool fresh = value.TimestampUtc != DateTime.MinValue && age >= 0 && age < 3;
+            if (!value.Available || value.Stale || !fresh || value.ConnectionsMeasured <= 0 ||
+                !value.MinimumMs.HasValue || !value.MaximumMs.HasValue ||
+                !ValidNumber(value.MinimumMs.Value) || !ValidNumber(value.MaximumMs.Value) || value.MinimumMs.Value > value.MaximumMs.Value)
+            { tcpRttUnavailableSnapshots++; return; }
+            tcpRttAvailableSnapshots++;
+            tcpRttObserved = true;
+            tcpRttMinimumMs = Math.Min(tcpRttMinimumMs, value.MinimumMs.Value);
+            tcpRttMaximumMs = Math.Max(tcpRttMaximumMs, value.MaximumMs.Value);
+        }
+
+        private void ObserveAdapterContinuity(MonitorSnapshot snapshot)
+        {
+            adapterCounterResets = Math.Max(adapterCounterResets, Math.Max(0, snapshot.AdapterCounterResets));
+            adapterCounterGaps = Math.Max(adapterCounterGaps, Math.Max(0, snapshot.AdapterCounterGaps));
+        }
+
+        private void ObserveAdapterCounters(MonitorSnapshot snapshot, bool createCandidate)
+        {
+            long beforeReceiveErrors = receiveErrors.Increase, beforeSendErrors = sendErrors.Increase;
+            long beforeReceiveDiscards = receiveDiscards.Increase, beforeSendDiscards = sendDiscards.Increase;
+            receiveErrors.Observe(snapshot.AdapterReceiveErrors);
+            sendErrors.Observe(snapshot.AdapterSendErrors);
+            receiveDiscards.Observe(snapshot.AdapterReceiveDiscards);
+            sendDiscards.Observe(snapshot.AdapterSendDiscards);
+            if (createCandidate && (receiveErrors.Increase > beforeReceiveErrors || sendErrors.Increase > beforeSendErrors ||
+                receiveDiscards.Increase > beforeReceiveDiscards || sendDiscards.Increase > beforeSendDiscards))
+                AddCandidate("adapter-counters", snapshot.TimestampUtc, snapshot.TimestampUtc, "PC 어댑터 오류·폐기 증가", "선택한 어댑터 전체 프로그램의 통계 · 게임 손실로 단정할 수 없음");
+        }
+
         // Call exactly once for each raw ProbeRunner sample, never with a rolling ProbeSummary.
         public void ObserveProbe(string kind, ProbeSample sample)
         {
@@ -345,6 +419,12 @@ namespace GameNetworkMonitor
                 }
                 text.AppendLine("기록 범위: " + Time(firstAt) + " ~ " + Time(lastAt) + " (" + Number(Math.Max(0, (lastAt - firstAt).TotalSeconds)) + "초, 표본 공백 포함)");
                 text.AppendLine("상태 표본 " + snapshots.ToString(CultureInfo.InvariantCulture) + "개 · 측정 중 " + runningSnapshots.ToString(CultureInfo.InvariantCulture) + "개 · 중복·역순·시각 누락 제외 " + ignoredSnapshots.ToString(CultureInfo.InvariantCulture) + "개");
+                if (finalSnapshots > 0)
+                {
+                    text.AppendLine("종료 최종 표본 " + finalSnapshots.ToString(CultureInfo.InvariantCulture) + "개 · ETW 종료 배출 " + (finalDrainComplete ? "완료 보고" : "완료 미확인") +
+                        " · 경계 " + finalBoundaryStatus + (finalStopRequestedUtc.HasValue ? " · 중지 요청 " + Time(finalStopRequestedUtc.Value) : ""));
+                    text.AppendLine("종료 최종 표본은 누적 TCP·PC·ETW 누락 카운터와 프로그램 최종 구간에만 반영하며, 일반 표본 가용률·지연·공백·네트워크 후보에서 제외합니다. 종료 배출 완료가 전체 이벤트 보존을 보장하지는 않습니다.");
+                }
                 if (snapshotGaps > 0)
                     text.AppendLine("3초 이상 상태 표본 공백 " + snapshotGaps.ToString(CultureInfo.InvariantCulture) + "회 · 최대 " + Number(maximumSnapshotGap) + "초. 기록 공백을 정상 구간으로 간주하지 않습니다.");
                 if (selectedSnapshots > 0)
@@ -358,6 +438,12 @@ namespace GameNetworkMonitor
                     text.AppendLine("ETW 전달 지연 후보 표본 " + deliveryDelaySnapshots.ToString(CultureInfo.InvariantCulture) + "개 · 전달 신선도 미제공 표본 " + deliveryMissingSnapshots.ToString(CultureInfo.InvariantCulture) + "개. 발생 시각만 오래된 이벤트를 수신 중단으로 판정하지 않습니다.");
                 }
                 else text.AppendLine("게임 선택 표본 없음 · 게임 통신 상태 판단 불가");
+                text.AppendLine("TCP 연결 RTT: 일반 요청 표본 중 가용 " + Ratio(tcpRttAvailableSnapshots, tcpRttRequestedSnapshots) +
+                    " · 미측정 " + tcpRttUnavailableSnapshots.ToString(CultureInfo.InvariantCulture) + "개 · 권한 부족 " + tcpRttPermissionSnapshots.ToString(CultureInfo.InvariantCulture) +
+                    "개 · 일부 연결만 수집 " + tcpRttPartialSnapshots.ToString(CultureInfo.InvariantCulture) + "개");
+                text.AppendLine("  Windows TCP 연결별 평활 RTT 관측 범위: " + (tcpRttObserved ? Number(tcpRttMinimumMs) + " ~ " + Number(tcpRttMaximumMs) + " ms" : "관측값 없음") +
+                    (String.IsNullOrEmpty(tcpRttLastStatus) ? "" : " · 마지막 수집 상태 " + tcpRttLastStatus));
+                text.AppendLine("  가용률은 일반 상태 표본 기준이며 RTT 표본 수가 아닙니다. 종료 최종 표본은 제외합니다. TCP 연결은 로그인·다운로드용일 수도 있어 실제 게임 서버 핑으로 대표하지 않습니다. 실제 게임 핑·게임 패킷 유실률: 미지원.");
                 text.AppendLine("PC 어댑터 누적 통계 가용: " + Ratio(adapterAvailableSnapshots, runningSnapshots));
                 text.AppendLine("PC 선택 NIC 송신 관측 최대 " + (adapterRateSnapshots == 0 ? "관측값 없음" : Rate(maximumAdapterSend)) + " · 10.0 MB/s 이상 표본 " + highSendSnapshots.ToString(CultureInfo.InvariantCulture) + "개" + (lastHighSendAt == DateTime.MinValue ? "" : " · 최근 " + Time(lastHighSendAt)));
                 text.AppendLine("대량 송신 중 최근 2.5초 이내 공유기 RTT 20 ms 이상 동시 관측: 상태 표본 " + highSendAndRttSnapshots.ToString(CultureInfo.InvariantCulture) + "개 / 서로 다른 원시 ICMP " + highSendAndRttProbes.ToString(CultureInfo.InvariantCulture) + "개. 시간적 동시 관측이며 원인·게임 손실의 증거로 확정하지 않습니다.");
@@ -375,6 +461,8 @@ namespace GameNetworkMonitor
                 AppendCounter(text, "ETW 수집 이벤트 누락", traceEventsLost);
                 AppendCounter(text, "ETW 수집 버퍼 누락", traceBuffersLost);
                 text.AppendLine("카운터 감소는 리셋으로 분리합니다. 첫 표본 이전과 리셋 사이의 증가량은 알 수 없어 합산하지 않습니다.");
+                if (adapterCounterResets > 0 || adapterCounterGaps > 0)
+                    text.AppendLine("PC 누적 카운터 연속성: 감소 관측 " + adapterCounterResets.ToString(CultureInfo.InvariantCulture) + "회 · 수집 공백 " + adapterCounterGaps.ToString(CultureInfo.InvariantCulture) + "회. 이전 관측 증가량은 보존하며 경계·공백 중 발생량을 복원한 값은 아닙니다.");
                 text.AppendLine();
                 text.AppendLine("자동 후보 규칙: ICMP 2회 이상 연속 시간 초과(표본 사이 2.5초 이하), 공유기 RTT 20 ms 이상, 외부 RTT 150 ms 이상, 활성 ETW·마지막 게임 수신 전달 후 3초 이상 관측 없음, 선택 NIC 송신 10 MB/s 이상·최근 공유기 고지연 동시 관측.");
                 text.AppendLine("수집 품질 규칙: 최근 2초 이벤트 전달 지연 최대 2000 ms 이상 또는 발생 기준 수신 경과 3초 이상이지만 전달 기준 경과는 3초 미만이면 ETW 전달 지연 후보로 분리합니다.");
@@ -401,11 +489,27 @@ namespace GameNetworkMonitor
             if (lastAt == DateTime.MinValue || now > lastAt) lastAt = now;
         }
 
-        private void ObserveProcessTraffic(MonitorSnapshot snapshot)
+        private void ObserveProcessTraffic(MonitorSnapshot snapshot, bool final)
         {
             ProcessTrafficSnapshot traffic = snapshot.ProcessTraffic;
             if (traffic == null || !traffic.Available || traffic.Rows == null) return;
-            processTrafficAvailableSnapshots++;
+            DateTime at = traffic.TimestampUtc == DateTime.MinValue ? snapshot.TimestampUtc : traffic.TimestampUtc;
+            if (lastProcessTrafficAt != DateTime.MinValue && at <= lastProcessTrafficAt) return;
+            bool intervalProvided = traffic.IntervalStartUtc != DateTime.MinValue || traffic.IntervalEndUtc != DateTime.MinValue || traffic.IntervalSeconds != 0;
+            if (intervalProvided)
+            {
+                if (traffic.IntervalStartUtc == DateTime.MinValue || traffic.IntervalEndUtc <= traffic.IntervalStartUtc ||
+                    traffic.IntervalEndUtc != at || !ValidNumber(traffic.IntervalSeconds) || traffic.IntervalSeconds <= 0) return;
+                double seconds = (traffic.IntervalEndUtc - traffic.IntervalStartUtc).TotalSeconds;
+                if (Math.Abs(seconds - traffic.IntervalSeconds) > Math.Max(0.000001, seconds * 0.000000001) ||
+                    (lastProcessIntervalEndAt != DateTime.MinValue && traffic.IntervalStartUtc < lastProcessIntervalEndAt)) return;
+                lastProcessIntervalEndAt = traffic.IntervalEndUtc;
+            }
+            // Legacy rows without interval metadata retain their snapshot-time behavior.
+            // Current cached, overlapping and forced-partial intervals share one watermark.
+            lastProcessTrafficAt = at;
+            if (final) finalProcessTrafficSnapshots++;
+            else processTrafficAvailableSnapshots++;
             foreach (ProcessTrafficRow row in traffic.Rows)
             {
                 if (row == null || row.ProcessId <= 0 || !ValidNumber(row.SentBytesPerSecond)) continue;
@@ -428,7 +532,7 @@ namespace GameNetworkMonitor
                 if (row.SentBytesPerSecond > peak.MaximumSend || peak.PeakAt == DateTime.MinValue)
                 {
                     peak.MaximumSend = row.SentBytesPerSecond;
-                    peak.PeakAt = snapshot.TimestampUtc;
+                    peak.PeakAt = at;
                     peak.ProcessName = Clean(row.ProcessName);
                     peak.IdentityAvailable = row.IdentityAvailable;
                 }
@@ -437,7 +541,7 @@ namespace GameNetworkMonitor
 
         private void AppendProcessPeaks(StringBuilder text)
         {
-            text.AppendLine("프로세스별 ETW 수집 가용 표본 " + processTrafficAvailableSnapshots.ToString(CultureInfo.InvariantCulture) + "개 · 모든 어댑터의 TCP/UDP 메타데이터이며 선택 NIC 통계와 직접 일치하지 않습니다.");
+            text.AppendLine("프로세스별 ETW 수집 가용 일반 표본 " + processTrafficAvailableSnapshots.ToString(CultureInfo.InvariantCulture) + "개 · 종료 최종 구간 " + finalProcessTrafficSnapshots.ToString(CultureInfo.InvariantCulture) + "개 · 모든 어댑터의 TCP/UDP 메타데이터이며 선택 NIC 통계와 직접 일치하지 않습니다.");
             text.AppendLine("  프로세스 속도는 이벤트가 수집기에 도착한 구간 기준입니다. ETW 전달 지연 시 한 구간에 몰릴 수 있어 실제 송신 발생 시각의 속도로 확정하지 않습니다.");
             if (processPeaks.Count == 0)
             {
@@ -693,6 +797,82 @@ namespace GameNetworkMonitor
                 errorOverview.NetworkCandidateCount == 0 && errorOverview.CollectionCandidateCount == 1 && !errorOverview.Events[0].IsNetworkEvidence,
                 "probe measurement errors presented as timeout or network outage");
             Check(bounded.SummaryText().IndexOf("고정 기준", StringComparison.Ordinal) >= 0 && bounded.SummaryText().IndexOf("확정하지 않습니다", StringComparison.Ordinal) >= 0, "rules or evidence boundary omitted");
+
+            SessionAnalysis ending = new SessionAnalysis();
+            MonitorSnapshot normal = GameFixture(began, 0, 0);
+            normal.AdapterRatesAvailable = true; normal.AdapterSentBytesPerSecond = 100;
+            normal.ProcessTraffic = ProcessFixture(began.AddSeconds(-1), 1, 10);
+            ending.Observe(normal);
+            MonitorSnapshot final = GameFixture(began.AddSeconds(10), 99, 99);
+            final.Running = false; final.IsFinal = true; final.StopDrainComplete = true;
+            final.StopBoundaryStatus = "fixture final boundary"; final.StopRequestedUtc = began.AddSeconds(9);
+            final.Trace.Active = false; final.Trace.EventsLost = 100; final.Trace.BuffersLost = 100;
+            final.RetransmitEvents = 1;
+            final.AdapterReceiveErrors = 1; final.AdapterSendErrors = 2;
+            final.AdapterReceiveDiscards = 3; final.AdapterSendDiscards = 4;
+            final.AdapterCounterResets = final.AdapterCounterGaps = 1;
+            final.AdapterRatesAvailable = true; final.AdapterSentBytesPerSecond = 99999999;
+            final.GameEventDeliveryLagMs = final.GameMaxEventDeliveryLagMs = 99999;
+            final.ProcessTraffic = ProcessFixture(began.AddSeconds(9.75), 0.25, 20);
+            ending.Observe(final);
+            AnalysisOverview finalOverview = ending.GetOverview();
+            Check(ending.snapshots == 2 && ending.runningSnapshots == 1 && ending.finalSnapshots == 1 &&
+                finalOverview.Samples == 2 && finalOverview.RunningSamples == 1 && finalOverview.FinalSamples == 1,
+                "final capture was lost or counted as a running sample");
+            Check(ending.requestedSnapshots == 1 && ending.activeSnapshots == 1 && ending.gameAvailableSnapshots == 1 &&
+                ending.adapterAvailableSnapshots == 1 && ending.selectedSnapshots == 1 && ending.inactiveSnapshots == 0 && ending.waitingSnapshots == 0,
+                "final capture distorted a running availability numerator or denominator");
+            Check(ending.retransmits.Increase == 1 && ending.receiveErrors.Increase == 1 && ending.sendErrors.Increase == 2 &&
+                ending.receiveDiscards.Increase == 3 && ending.sendDiscards.Increase == 4,
+                "inactive final ETW or final adapter counters were omitted");
+            Check(!final.Trace.Active && ending.traceEventsLost.Increase == 100 && ending.traceBuffersLost.Increase == 100 &&
+                ending.adapterRateSnapshots == 1 && ending.maximumAdapterSend == 100 && ending.highSendSnapshots == 0 &&
+                ending.snapshotGaps == 0 && ending.maximumSnapshotGap == 0 && !ending.deliveryLagObserved && ending.deliveryDelaySnapshots == 0 &&
+                ending.candidates.Count == 0, "final capture fabricated active ETW, rates, idle, lag, gaps or candidates");
+            Check(ending.processTrafficAvailableSnapshots == 1 && ending.finalProcessTrafficSnapshots == 1 &&
+                ending.processPeaks.Count == 1 && ending.processPeaks["21|fixture-instance"].MaximumSend == 20 &&
+                ending.processPeaks["21|fixture-instance"].PeakAt == final.TimestampUtc,
+                "final subsecond process interval was omitted or counted as normal availability");
+            Check(ending.lastSnapshotAt == final.TimestampUtc && ending.lastAt == final.TimestampUtc &&
+                ending.lastRunningSnapshotAt == normal.TimestampUtc && ending.adapterCounterResets == 1 && ending.adapterCounterGaps == 1,
+                "final capture did not extend the recorded range or retain continuity metadata");
+            string finalSummary = ending.SummaryText();
+            Check(finalSummary.IndexOf("PC 어댑터 누적 통계 가용: 100.000% (1/1)", StringComparison.Ordinal) >= 0 &&
+                finalSummary.IndexOf("ETW 활성 100.000% (1/1), 통신 수치 가용 100.000% (1/1)", StringComparison.Ordinal) >= 0 &&
+                finalSummary.IndexOf("종료 최종 표본 1개", StringComparison.Ordinal) >= 0 &&
+                finalSummary.IndexOf("fixture final boundary", StringComparison.Ordinal) >= 0,
+                "final capture inflated summary availability or omitted its separate boundary state");
+            ending.Observe(final);
+            Check(ending.snapshots == 2 && ending.finalSnapshots == 1 && ending.ignoredSnapshots == 1 &&
+                ending.retransmits.Increase == 1 && ending.retransmits.Observations == 2 && ending.finalProcessTrafficSnapshots == 1,
+                "duplicate final capture was counted twice");
+
+            SessionAnalysis cachedFinal = new SessionAnalysis();
+            normal = UploadFixture(began, 1); normal.ProcessTraffic = ProcessFixture(began.AddSeconds(-1), 1, 10);
+            cachedFinal.Observe(normal);
+            final = new MonitorSnapshot { TimestampUtc = began.AddSeconds(1), IsFinal = true,
+                ProcessTraffic = normal.ProcessTraffic };
+            cachedFinal.Observe(final);
+            Check(cachedFinal.processTrafficAvailableSnapshots == 1 && cachedFinal.finalProcessTrafficSnapshots == 0 &&
+                cachedFinal.processPeaks["21|fixture-instance"].MaximumSend == 10,
+                "cached normal process interval was counted again during final capture");
+            SessionAnalysis overlappingFinal = new SessionAnalysis();
+            overlappingFinal.Observe(normal);
+            final = new MonitorSnapshot { TimestampUtc = began.AddSeconds(1), IsFinal = true,
+                ProcessTraffic = ProcessFixture(began.AddSeconds(-0.5), 1.5, 999) };
+            overlappingFinal.Observe(final);
+            Check(overlappingFinal.finalProcessTrafficSnapshots == 0 && overlappingFinal.processPeaks["21|fixture-instance"].MaximumSend == 10,
+                "overlapping final process interval replaced a valid process peak");
+        }
+
+        private static ProcessTrafficSnapshot ProcessFixture(DateTime start, double seconds, double sendRate)
+        {
+            DateTime end = start.AddSeconds(seconds);
+            ProcessTrafficSnapshot result = new ProcessTrafficSnapshot { Available = true, TimestampUtc = end,
+                IntervalStartUtc = start, IntervalEndUtc = end, IntervalSeconds = seconds };
+            result.Rows.Add(new ProcessTrafficRow { ProcessId = 21, ProcessName = "fixture final process", ProcessInstance = "fixture-instance",
+                IdentityAvailable = true, SentBytesPerSecond = sendRate });
+            return result;
         }
 
         private static MonitorSnapshot GameFixture(DateTime at, double eventIdle, double? deliveryIdle)
