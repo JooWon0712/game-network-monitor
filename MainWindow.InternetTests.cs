@@ -44,7 +44,7 @@ namespace PcInternetMonitor
         private void CheckBounds(int width, int height)
         {
             FrameworkElement surface = (FrameworkElement)Content;
-            foreach (FrameworkElement element in new FrameworkElement[] { adapterPicker, startButton, stopButton, cards, historyList, dashboardFooter })
+            foreach (FrameworkElement element in new FrameworkElement[] { adapterPicker, startButton, stopButton, exitButton, cards, historyList, dashboardFooter })
             {
                 Point p = element.TranslatePoint(new Point(), surface);
                 Require(element.ActualWidth > 0 && element.ActualHeight > 0 && p.X >= 0 && p.Y >= 0 && p.X + element.ActualWidth <= width + 1 && p.Y + element.ActualHeight <= height, "fixed controls outside viewport");

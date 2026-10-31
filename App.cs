@@ -13,7 +13,7 @@ namespace PcInternetMonitor
 {
     public static class App
     {
-        public const string Version = "0.2.4";
+        public const string Version = "0.2.5";
         private static string exitContext = "명시적 종료 요청 미확인";
         private static volatile bool unhandledExceptionSeen;
 
@@ -21,6 +21,20 @@ namespace PcInternetMonitor
         public static int Main(string[] args)
         {
             string mode = args.Length > 0 ? args[0] : "";
+            SingleInstanceCoordinator instance = null;
+            if (!IsTestMode(mode))
+            {
+                try { instance = SingleInstanceCoordinator.AcquireOrSignal(); }
+                catch (Exception error) { MessageBox.Show("백그라운드 실행 준비에 실패했습니다.\n" + error.Message, "PC 인터넷 모니터"); return 1; }
+                if (!instance.IsOwner)
+                {
+                    bool restored = instance.RestoreSignalled;
+                    string error = instance.ErrorMessage;
+                    instance.Dispose();
+                    if (!restored) MessageBox.Show("기존 앱의 창을 열 수 없습니다. 앱이 시작되거나 종료되는 중일 수 있으니 잠시 후 다시 실행해 주세요.\n" + error, "PC 인터넷 모니터");
+                    return restored ? 0 : 1;
+                }
+            }
             string diagnosticRoot = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, IsTestMode(mode) ? "tests\\diagnostic-runs" : "diagnostics");
             DiagnosticsLog.Initialize(diagnosticRoot, Version, mode.Length == 0 ? "normal" : mode);
             AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e) {
@@ -36,13 +50,13 @@ namespace PcInternetMonitor
                 DiagnosticsLog.Shutdown("process_exit observed; this event alone does not prove a normal exit");
             };
             int result = 1;
-            try { result = Run(args); }
+            try { result = Run(args, instance); }
             catch (Exception error) {
                 unhandledExceptionSeen = true;
                 DiagnosticsLog.Write("entry_failure", "main entry failed", error);
                 if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + error.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "PC 인터넷 모니터");
             }
-            finally { DiagnosticsLog.Write("main_return", "exit_code=" + result + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen); }
+            finally { if (instance != null) instance.Dispose(); DiagnosticsLog.Write("main_return", "exit_code=" + result + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen); }
             return result;
         }
 
@@ -54,15 +68,17 @@ namespace PcInternetMonitor
 
         private static bool IsTestMode(string mode)
         {
-            return mode == "--feedback-test" || mode == "--tray-test" || mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test" || mode == "--tcp-rtt-test" || mode == "--internet-test" || mode == "--internet-loopback-test" || mode == "--internet-recording-test";
+            return mode == "--single-instance-test" || mode == "--single-instance-helper" || mode == "--background-test" || mode == "--feedback-test" || mode == "--self-test" || mode == "--smoke-test" || mode == "--recording-test" || mode == "--probe-test" || mode == "--lifecycle-test" || mode == "--tcp-rtt-test" || mode == "--internet-test" || mode == "--internet-loopback-test" || mode == "--internet-recording-test";
         }
 
-        private static int Run(string[] args)
+        private static int Run(string[] args, SingleInstanceCoordinator instance)
         {
             string mode = args.Length > 0 ? args[0] : "";
             string testDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tests");
             try
             {
+                if (mode == "--single-instance-helper") return SingleInstanceTests.RunHelper(args);
+                if (mode == "--single-instance-test") { SingleInstanceTests.Run(testDir); return 0; }
                 if (mode == "--self-test")
                 {
                     KernelNetworkMonitor.SelfTest(); ProbeRunner.SelfTest(); MonitorController.SelfTest(); StartupSelection.SelfTest();
@@ -87,7 +103,7 @@ namespace PcInternetMonitor
                     DiagnosticsLog.Write("dispatcher_unhandled_exception", "handled=" + e.Handled, e.Exception);
                     // Do not set Handled=true or continue after an unknown UI failure.
                 };
-                app.SessionEnding += delegate(object sender, SessionEndingCancelEventArgs e) { foreach (Window owned in app.Windows) { MainWindow monitor = owned as MainWindow; if (monitor != null) monitor.AllowSystemShutdown(); } NoteExitRequest("Windows 종료 요청: " + e.ReasonSessionEnding); };
+                app.SessionEnding += delegate(object sender, SessionEndingCancelEventArgs e) { if (instance != null) instance.BeginShutdown(); foreach (Window owned in app.Windows) { MainWindow monitor = owned as MainWindow; if (monitor != null) monitor.AllowSystemShutdown(); } NoteExitRequest("Windows 종료 요청: " + e.ReasonSessionEnding); };
                 app.Exit += delegate(object sender, ExitEventArgs e) {
                     DiagnosticsLog.Write("application_exit", "exit_code=" + e.ApplicationExitCode + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
                 };
@@ -98,14 +114,14 @@ namespace PcInternetMonitor
                     finally { app.Shutdown(); }
                     return 0;
                 }
-                if (mode == "--tray-test")
+                if (mode == "--background-test")
                 {
                     app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
-                    try { MainWindow.RunTrayTests(Path.Combine(testDir, "tray-test.txt")); }
+                    try { MainWindow.RunBackgroundTests(Path.Combine(testDir, "background-test.txt")); }
                     finally { app.Shutdown(); }
                     return 0;
                 }
-                MainWindow window = mode == "--recording-test" || mode == "--smoke-test" || mode == "--internet-recording-test" ? new MainWindow(null, Path.Combine(testDir, "internet-ui-fixture-" + Guid.NewGuid().ToString("N"))) : new MainWindow(StartupSelection.FromArgs(args));
+                MainWindow window = IsTestMode(mode) ? new MainWindow(null, Path.Combine(testDir, "internet-ui-fixture-" + Guid.NewGuid().ToString("N"))) : new MainWindow(StartupSelection.FromArgs(args));
                 if (mode == "--internet-recording-test") { window.InternetRecordingTest(Path.Combine(testDir, "internet-recording-test.txt")); window.Close(); app.Shutdown(); return 0; }
                 if (mode == "--lifecycle-test")
                 {
@@ -129,7 +145,7 @@ namespace PcInternetMonitor
                     File.WriteAllText(Path.Combine(testDir, "smoke-test.txt"), "PASS v" + Version + ": PC internet dashboard, four checks, DNS/HTTPS success/failure/stale/stopped, persistent history merge, fixed connection controls and scrollable history. Synthetic UI only, no network or UAC.\r\n", Encoding.UTF8);
                     app.Shutdown(); return 0;
                 }
-                if (!IsTestMode(mode)) window.EnableBackgroundTray();
+                if (!IsTestMode(mode)) { window.BackgroundClosing += instance.BeginShutdown; instance.AttachRestore(window.RestoreFromBackground); window.EnableBackgroundMode(); }
                 return app.Run(window);
             }
             catch (Exception e)

@@ -43,7 +43,7 @@ namespace PcInternetMonitor
                 DateTime completed = DateTime.UtcNow;
                 window.RecordInternetCheck(new InternetCheckSample { Kind = "https", Target = DefaultHttpsUrl, State = "success", Success = true, Generation = window.internet.Generation, StartedUtc = completed.AddSeconds(1), TimestampUtc = completed });
                 MainWindow owned = window;
-                PumpTrayUntil(delegate { return !owned.running; }, 3000, "inverted clock did not stop measurement");
+                PumpBackgroundUntil(delegate { return !owned.running; }, 3000, "inverted clock did not stop measurement");
                 Require(window.fault && window.stopReason.Contains("시스템 시각 변경") && window.clockStopUtc != DateTime.MinValue, "clock discontinuity stop was silent");
                 Require(window.history.GetRecent(100).Where(x => x.Kind == "dns").All(x => x.State != "open" && !x.RecoveredUtc.HasValue), "clock change invented recovery");
                 Require(File.ReadAllText(Path.Combine(clockSession, "session.txt")).Contains("state=completed") && File.ReadAllText(Path.Combine(clockSession, "summary.txt")).Contains("시스템 시각 변경"), "clock stop was not finalized and explained");
@@ -68,7 +68,7 @@ namespace PcInternetMonitor
                 Require(!File.ReadAllText(Path.Combine(nextSession, "summary.txt")).Contains("older-epoch.example"), "old epoch incident leaked into a new session summary");
                 File.WriteAllText(reportPath, "PASS: synthetic ICMP failure/error/UI/CSV distinction, target-change recovery-unknown boundary, stopped card reset, in-flight time inversion and backward-clock safe stop, finalized history/summary and explicit restart. OS clock and network configuration were not changed.\r\n", new UTF8Encoding(true));
             }
-            finally { if (window != null) { window.trayExitRequested = true; try { window.Close(); } finally { window.DisposeTray(); window.DisposeMonitor(); } } }
+            finally { if (window != null) { window.appExitRequested = true; try { window.Close(); } finally { window.DisposeMonitor(); } } }
         }
     }
 }

@@ -13,7 +13,7 @@ $buildDirectory = Join-Path $projectDir '.build'
 New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
 $temporaryOutput = Join-Path $buildDirectory ('PcInternetMonitor-' + [Guid]::NewGuid().ToString('N') + '.exe')
 try {
-    $compilerArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/utf8output', '/main:PcInternetMonitor.App', ('/out:' + $temporaryOutput), '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll', '/r:System.Xaml.dll', ('/r:' + (Join-Path $frameworkDir 'WPF\WindowsBase.dll')), ('/r:' + (Join-Path $frameworkDir 'WPF\PresentationCore.dll')), ('/r:' + (Join-Path $frameworkDir 'WPF\PresentationFramework.dll')))
+    $compilerArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/utf8output', '/main:PcInternetMonitor.App', ('/out:' + $temporaryOutput), '/r:System.dll', '/r:System.Core.dll', '/r:System.Xaml.dll', ('/r:' + (Join-Path $frameworkDir 'WPF\WindowsBase.dll')), ('/r:' + (Join-Path $frameworkDir 'WPF\PresentationCore.dll')), ('/r:' + (Join-Path $frameworkDir 'WPF\PresentationFramework.dll')))
     $compilerArgs += @(('/win32icon:' + $iconPath), ('/resource:' + $iconPath + ',PcInternetMonitor.AppIcon.ico'))
     & $compilerPath @compilerArgs @sourceFiles
     if ($LASTEXITCODE -ne 0) { throw "컴파일 실패: $LASTEXITCODE" }

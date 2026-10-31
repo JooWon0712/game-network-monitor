@@ -32,7 +32,7 @@ namespace PcInternetMonitor
         private IntPtr OnFrameMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
             // Queue after WPF has refreshed its cached system settings. Never consume
-            // native messages: sizing, snap, title-bar buttons and tray close stay native.
+            // native messages: sizing, snap, title-bar buttons and close stay native.
             if ((message == 0x001A || message == 0x031A || message == 0x0320) && !frameUpdateQueued && !frameClosed)
             {
                 frameUpdateQueued = true;
