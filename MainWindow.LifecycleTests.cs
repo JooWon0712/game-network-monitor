@@ -15,10 +15,10 @@ namespace PcInternetMonitor
         public static int RunWindowCloseHelper(Application app, string[] args)
         {
             Guid id;
-            if (args.Length != 3 || !WindowCloseTests.Cases.Contains(args[1]) || !Guid.TryParseExact(args[2], "N", out id)) return 3;
+            if ((args.Length != 3 && args.Length != 4) || !WindowCloseTests.Cases.Contains(args[1]) || !Guid.TryParseExact(args[2], "N", out id)) return 3;
             Require(app.ShutdownMode == ShutdownMode.OnMainWindowClose, "close helper must use normal application shutdown");
             string scenario = args[1];
-            string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tests", "window-close-fixture-" + args[2], scenario);
+            string root = Path.Combine(App.TestDirectory, "window-close-fixture-" + args[2], scenario);
             Directory.CreateDirectory(root);
             MainWindow window = new MainWindow(null, Path.Combine(root, "records")) { ShowActivated = false, ShowInTaskbar = false };
             window.gatewayOverride = window.referenceOverride = "127.0.0.1";

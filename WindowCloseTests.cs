@@ -19,9 +19,10 @@ namespace PcInternetMonitor
             {
                 using (Process child = Process.Start(new ProcessStartInfo {
                     FileName = Assembly.GetExecutingAssembly().Location,
-                    Arguments = "--window-close-helper " + scenario + " " + id,
-                    UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory }))
+                    Arguments = "--window-close-helper " + scenario + " " + id + " " + App.TestRunId,
+                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory }))
                 {
+                    var errorTask = child.StandardError.ReadToEndAsync();
                     if (!child.WaitForExit(20000))
                     {
                         // Only this isolated helper, never a user's running app.
@@ -30,8 +31,9 @@ namespace PcInternetMonitor
                     }
                     string report = Path.Combine(root, scenario, "result.txt");
                     string text = File.Exists(report) ? File.ReadAllText(report) : "missing helper result";
+                    string error = errorTask.GetAwaiter().GetResult();
                     if (child.ExitCode != 0 || !text.StartsWith("PASS", StringComparison.Ordinal))
-                        throw new InvalidOperationException("Window close helper " + scenario + " exit=" + child.ExitCode + ": " + text);
+                        throw new InvalidOperationException("Window close helper " + scenario + " exit=" + child.ExitCode + ": " + text + "\n" + error);
                 }
             }
             Directory.CreateDirectory(testDirectory);

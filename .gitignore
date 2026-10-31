@@ -8,6 +8,7 @@
 /tests/**
 !/tests/**/
 !/tests/**/*.cs
+/tests/.run-*/
 /VALIDATION.md
 
 # Local measurement records, app diagnostics and analysis output

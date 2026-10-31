@@ -16,12 +16,17 @@ namespace PcInternetMonitor
         public const string Version = "0.2.6";
         private static string exitContext = "명시적 종료 요청 미확인";
         private static volatile bool unhandledExceptionSeen;
+        private static TestRunScope testRun;
+        internal static string TestDirectory { get { return testRun.DirectoryPath; } }
+        internal static string TestRunId { get { return testRun.Id; } }
 
         [STAThread]
         public static int Main(string[] args)
         {
             string mode = args.Length > 0 ? args[0] : "";
-            string diagnosticRoot = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, IsTestMode(mode) ? "tests\\diagnostic-runs" : "diagnostics");
+            try { if (IsTestMode(mode)) testRun = mode == "--window-close-helper" && args.Length == 4 ? TestRunScope.Borrow(args[3]) : TestRunScope.Create(); }
+            catch (Exception error) { Console.Error.WriteLine(error); return 1; }
+            string diagnosticRoot = testRun == null ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "diagnostics") : Path.Combine(TestDirectory, "diagnostics");
             DiagnosticsLog.Initialize(diagnosticRoot, Version, mode.Length == 0 ? "normal" : mode);
             AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e) {
                 unhandledExceptionSeen = true;
@@ -32,6 +37,7 @@ namespace PcInternetMonitor
                 // Preserve the runtime's exception policy; do not mark it observed here.
             };
             AppDomain.CurrentDomain.ProcessExit += delegate {
+                if (testRun != null) return; // Test diagnostics are closed before their owned files are removed.
                 DiagnosticsLog.Write("process_exit", "exit_code=" + Environment.ExitCode + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
                 DiagnosticsLog.Shutdown("process_exit observed; this event alone does not prove a normal exit");
             };
@@ -41,8 +47,18 @@ namespace PcInternetMonitor
                 unhandledExceptionSeen = true;
                 DiagnosticsLog.Write("entry_failure", "main entry failed", error);
                 if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + error.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "PC 인터넷 모니터");
+                else Console.Error.WriteLine(error);
             }
-            finally { DiagnosticsLog.Write("main_return", "exit_code=" + result + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen); }
+            finally
+            {
+                DiagnosticsLog.Write("main_return", "exit_code=" + result + "; context=" + exitContext + "; unhandled_exception_seen=" + unhandledExceptionSeen);
+                if (testRun != null)
+                {
+                    DiagnosticsLog.Shutdown("test completed; removing this run's temporary files");
+                    try { testRun.Dispose(); }
+                    catch (Exception error) { Console.Error.WriteLine("Test temporary file cleanup failed: " + error); result = 2; }
+                }
+            }
             return result;
         }
 
@@ -60,13 +76,13 @@ namespace PcInternetMonitor
         private static int Run(string[] args)
         {
             string mode = args.Length > 0 ? args[0] : "";
-            string testDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tests");
+            string testDir = testRun == null ? null : TestDirectory;
             try
             {
                 if (mode == "--window-close-test") { WindowCloseTests.Run(testDir); return 0; }
                 if (mode == "--self-test")
                 {
-                    KernelNetworkMonitor.SelfTest(); ProbeRunner.SelfTest(); MonitorController.SelfTest(); StartupSelection.SelfTest();
+                    TestRunScope.SelfTest(); KernelNetworkMonitor.SelfTest(); ProbeRunner.SelfTest(); MonitorController.SelfTest(); StartupSelection.SelfTest();
                     AutomaticSessionLog.SelfTest(testDir); SessionAnalysis.SelfTest(); DiagnosticsLog.SelfTest(testDir); ProgramUsageTotals.SelfTest();
                     ExportTest(testDir);
                     AdapterCounterTotals.SelfTest(); MeasurementQuality.SelfTest();
@@ -130,9 +146,10 @@ namespace PcInternetMonitor
             {
                 unhandledExceptionSeen = true;
                 DiagnosticsLog.Write("main_exception", "application startup or dispatch failed", e);
-                try { Directory.CreateDirectory(testDir); File.WriteAllText(Path.Combine(testDir, "last-error.txt"), e.ToString(), Encoding.UTF8); }
+                try { if (testDir != null) { Directory.CreateDirectory(testDir); File.WriteAllText(Path.Combine(testDir, "last-error.txt"), e.ToString(), Encoding.UTF8); } }
                 catch (Exception writeError) { DiagnosticsLog.Write("legacy_error_write_failed", "could not write test error file", writeError); }
                 if (!IsTestMode(mode)) MessageBox.Show("프로그램 오류로 종료합니다.\n" + e.Message + "\n진단 기록: " + DiagnosticsLog.FilePath, "PC 인터넷 모니터");
+                else Console.Error.WriteLine(e);
                 return 1;
             }
         }
