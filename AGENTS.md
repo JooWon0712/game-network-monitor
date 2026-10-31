@@ -7,7 +7,15 @@
 - 아이콘 원본은 `assets/app-icon.png`, 실행 파일·WPF 창용은 `assets/app-icon.ico`다. 같은 ICO를 `/win32icon`과 `PcInternetMonitor.AppIcon.ico` 관리 리소스로 내장하며 외부 파일 경로에 의존하지 않는다.
 - 현재 저장소 주소는 `https://github.com/JooWon0712/pc-internet-monitor`이다. 개인 측정 데이터·테스트 결과·로컬 절대경로·과거 작업 이력을 공유 소스와 문서에 추가하지 않는다.
 
-- 빌드·실측 범위·EXE 해시 보고서가 필요하면 로컬 `VALIDATION.md` 또는 `outputs/`에 기록하고 Git에는 추가하지 않는다. 최종 검사가 진행 중이면 완료로 단정하지 않는다. 일반 권한 실행, 실제 장애 재현과 장시간 성능은 해당 실측 근거가 있을 때만 검증됐다고 설명한다.
+- 개인 개발 환경의 빌드·실측 범위·해시 보고서는 로컬 `VALIDATION.md` 또는 `outputs/`에 기록하고 Git에는 추가하지 않는다. 공개 CI에서 만든 릴리스의 SHA-256·소스 커밋·출처 증명은 사용자의 배포 검증 자료로 공개할 수 있다. 최종 검사가 진행 중이면 완료로 단정하지 않는다. 일반 권한 실행, 실제 장애 재현과 장시간 성능은 해당 실측 근거가 있을 때만 검증됐다고 설명한다.
+
+# 공개 빌드와 출처 증명
+
+- v0.2.7부터 릴리스 EXE는 `.github/workflows/build.yml`의 GitHub-hosted Windows 빌드·회귀 검사 산출물을 그대로 사용한다. 로컬에서 재컴파일한 EXE를 CI 출처 증명과 함께 배포하거나 기존 릴리스의 파일·태그를 덮어쓰지 않는다.
+- 워크플로의 외부 action은 전체 커밋 SHA로 고정한다. PR 검사는 읽기 권한만 사용하고, 신뢰하는 main 빌드에서만 출처 증명에 필요한 OIDC·attestations 쓰기 권한을 부여한다. 개인 토큰·로컬 환경 정보·실제 사용자 기록을 워크플로·산출물·릴리스에 넣지 않는다.
+- 배포 파일은 `PcInternetMonitor.exe`와 선택 검증 자료 `SHA256SUMS.txt`, `provenance.json`으로 제한한다. 앱 실행에는 EXE만 필요하다. `logs/`, `diagnostics/`, `tests/`, `outputs/` 등 개발·측정 자료를 묶어서 올리지 않는다.
+- 릴리스 전에 EXE 해시와 증명을 검증하고 예상 저장소·소스 커밋·main ref·서명 워크플로·GitHub-hosted runner identity를 확인한다. 커밋은 `--source-digest` 등으로 고정하고 태그·최종 소스와 일치시킨다. CI 회귀 검사를 일반 권한 실행 실측으로 설명하지 않는다.
+- artifact attestation은 빌드 출처 검증 자료이며 Authenticode 게시자 서명이나 보안 무결함 증명이 아니다. 미서명 EXE의 SmartScreen 경고 가능성을 숨기거나 보안 기능 해제를 안내하지 않는다. 검증 명령과 공개 CI 링크를 README·릴리스에 제공한다.
 
 # 기본 화면과 사용 흐름
 

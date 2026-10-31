@@ -1,0 +1,117 @@
+name: Build and provenance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test Windows EXE
+    runs-on: windows-2022
+    timeout-minutes: 15
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      exe-sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - name: Check out public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the canonical EXE
+        shell: pwsh
+        run: ./build.ps1 -UpdateExecutable
+      - name: Run regression and cleanup checks
+        shell: pwsh
+        run: ./test.ps1
+      - name: Prepare only public release files
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'pc-internet-monitor-public'
+          New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+          $exe = Get-Item -LiteralPath ./PcInternetMonitor.exe
+          $digest = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $stage 'PcInternetMonitor.exe')
+          [IO.File]::WriteAllText((Join-Path $stage 'SHA256SUMS.txt'), "$digest  PcInternetMonitor.exe`n", [Text.UTF8Encoding]::new($false))
+          "sha256=$digest" >> $env:GITHUB_OUTPUT
+          "### Tested Windows EXE`nSHA-256: $digest`nSource: $env:GITHUB_SHA" >> $env:GITHUB_STEP_SUMMARY
+      - name: Upload EXE and checksum
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PcInternetMonitor-windows-x64
+          path: |
+            ${{ runner.temp }}/pc-internet-monitor-public/PcInternetMonitor.exe
+            ${{ runner.temp }}/pc-internet-monitor-public/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: Attest tested EXE
+    needs: build
+    if: >-
+      github.repository == 'JooWon0712/pc-internet-monitor' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # This job does not check out or execute repository code or the EXE.
+      - name: Download only this run's tested artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/pc-internet-monitor-public
+          digest-mismatch: error
+      - name: Validate artifact files and EXE digest
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.exe-sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/pc-internet-monitor-public"
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 2 ]]
+          [[ -f PcInternetMonitor.exe && ! -L PcInternetMonitor.exe ]]
+          [[ -f SHA256SUMS.txt && ! -L SHA256SUMS.txt ]]
+          printf '%s  PcInternetMonitor.exe\n' "$EXPECTED_SHA256" | cmp - SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+      - name: Generate GitHub build provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/pc-internet-monitor-public/PcInternetMonitor.exe
+          create-storage-record: false
+      - name: Verify provenance against this exact source commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$ATTESTATION_BUNDLE" "$RUNNER_TEMP/pc-internet-monitor-public/provenance.json"
+          gh attestation verify "$RUNNER_TEMP/pc-internet-monitor-public/PcInternetMonitor.exe" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref refs/heads/main \
+            --deny-self-hosted-runners \
+            --bundle "$RUNNER_TEMP/pc-internet-monitor-public/provenance.json"
+      - name: Upload verified provenance bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PcInternetMonitor-provenance
+          path: ${{ runner.temp }}/pc-internet-monitor-public/provenance.json
+          if-no-files-found: error
+          retention-days: 14

@@ -2,7 +2,7 @@
 
 내 PC의 연결과 인터넷 검사 결과를 기록하고, **어느 검사에서 언제 실패했고 언제 회복했는지** 확인하는 Windows 앱입니다.
 
-현재 버전은 **0.2.6**이며 저장소 이름은 **`pc-internet-monitor`**입니다. 소스 저장소: [JooWon0712/pc-internet-monitor](https://github.com/JooWon0712/pc-internet-monitor).
+현재 버전은 **0.2.7**이며 저장소 이름은 **`pc-internet-monitor`**입니다. 소스 저장소: [JooWon0712/pc-internet-monitor](https://github.com/JooWon0712/pc-internet-monitor).
 
 ## 다운로드
 
@@ -11,6 +11,28 @@
 실행 환경은 **Windows 10/11 64비트(x64)**와 **.NET Framework 4.8**입니다. 별도 드라이버·Python·Node 설치는 필요하지 않습니다.
 
 설치 없이 `PcInternetMonitor.exe` 하나를 실행하면 됩니다. 아이콘은 실행 파일에 내장돼 있으며, 기본 기능은 일반 권한으로 사용하도록 구성돼 있습니다. 파일은 기록을 저장할 수 있는 폴더에 두세요. 측정 기록은 실행 파일 옆의 `logs/`, 진단 기록은 `diagnostics/`에 생성됩니다.
+
+릴리스의 `SHA256SUMS.txt`와 `provenance.json`은 파일과 빌드 출처를 확인하려는 사용자를 위한 선택 자료입니다. 앱 실행에는 필요하지 않습니다.
+
+## 다운로드 파일의 출처 확인
+
+v0.2.7부터 배포 EXE는 공개 저장소의 [GitHub Actions 빌드](https://github.com/JooWon0712/pc-internet-monitor/actions/workflows/build.yml)에서 만듭니다. Windows runner에서 빌드·회귀 검사를 수행하고, 생성한 EXE의 SHA-256과 GitHub artifact attestation을 발급합니다. 릴리스에는 이 CI 산출물을 그대로 사용하며, 개인 PC에서 다시 빌드한 파일로 바꾸지 않습니다. 기존 v0.2.6 이하 릴리스는 이 방식의 출처 증명 대상이 아닙니다.
+
+출처 증명은 **파일의 해시와 빌드를 수행한 저장소·소스 커밋·워크플로의 관계**를 검증하는 자료입니다. 백도어가 없다는 증명, 보안 감사, 모든 환경에서의 정상 동작 보장 또는 Windows 게시자 서명(Authenticode)을 뜻하지 않습니다. [GitHub의 출처 증명 설명](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
+
+현재 EXE에는 Authenticode 서명이 없습니다. GitHub 출처 증명을 제공해도 Windows의 게시자 서명으로 바뀌지 않으므로 SmartScreen 경고나 정책에 따른 차단이 발생할 수 있습니다. [Microsoft의 SmartScreen 설명](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)
+
+[GitHub CLI](https://cli.github.com/)를 사용하는 검증자는 다운로드한 EXE가 있는 폴더에서 다음 명령으로 저장소와 서명 워크플로, GitHub-hosted runner의 출처 증명을 확인할 수 있습니다.
+
+```powershell
+gh attestation verify .\PcInternetMonitor.exe `
+  --repo JooWon0712/pc-internet-monitor `
+  --signer-workflow JooWon0712/pc-internet-monitor/.github/workflows/build.yml `
+  --source-ref refs/heads/main `
+  --deny-self-hosted-runners
+```
+
+특정 릴리스의 소스 커밋까지 고정하려면 위 명령에 `--source-digest`와 해당 릴리스 노트의 전체 커밋 SHA를 추가하세요. 함께 받은 증명 파일을 사용하려면 `--bundle .\provenance.json`도 추가할 수 있습니다. 검증에 성공한 저장소·워크플로·커밋과 다운로드한 릴리스가 일치하는지 확인하세요. SHA-256만 비교하면 파일이 같은지는 확인할 수 있지만, 그것만으로 빌드 출처나 안전성이 증명되지는 않습니다.
 
 ## 사용
 
@@ -90,7 +112,7 @@ HTTPS는 Windows/.NET의 기본 인증서 검증과 프록시 설정을 사용�
 
 앱 수명 주기 진단은 `diagnostics/`에 따로 기록합니다. 마지막 관측 시각은 디스크 쓰기 완료 시각이 아니고, `session.txt`의 `state=completed`는 파일 기록 완료를 뜻하며 정상 앱 종료의 증명은 아닙니다. 디스크 오류·대기열 초과가 생기면 오류로 검사를 멈춥니다. 강제 종료·전원 차단에서는 최근 기록과 종료 요약이 남지 않을 수 있습니다.
 
-측정 기록과 진단 파일은 로컬 데이터이며 Git에서 제외합니다. 배포할 때는 실행 파일만 전달하고 `logs/`, `diagnostics/`, 테스트 산출물과 `outputs/`는 포함하지 않습니다.
+측정 기록과 진단 파일은 로컬 데이터이며 Git에서 제외합니다. 배포에는 실행 파일과 공개 빌드 검증 자료만 포함하고 `logs/`, `diagnostics/`, 테스트 산출물과 `outputs/`는 포함하지 않습니다.
 
 ## 개인정보와 외부 통신
 
@@ -98,7 +120,7 @@ HTTPS는 Windows/.NET의 기본 인증서 검증과 프록시 설정을 사용�
 - **기록에 포함되는 정보:** 검사 시각·대상 주소·응답 시간·HTTP 상태·오류, 어댑터 이름·ID와 트래픽 통계, 실패·회복 이력을 기록합니다. 진단에는 앱 자신의 PID, 실행·종료 정보, 파일 경로와 예외 내용이 포함됩니다. 저장 위치나 오류 내용에 Windows 사용자 이름 같은 환경 정보가 나타날 수 있으므로 공유 전에 주소·ID·경로를 확인하세요.
 - **외부 검사 요청:** 연결 확인을 위해 공유기와 `1.1.1.1`에 ICMP, `www.microsoft.com`에 대한 시스템 DNS 조회, `https://www.gstatic.com/generate_204`에 HTTPS 요청을 보냅니다. 검사 대상·DNS 제공자·프록시에는 공인 IP나 조회 도메인 등 일반적인 접속 정보가 전달될 수 있습니다. DNS는 시스템 캐시를 사용할 수 있으며 경로는 Windows 라우팅·VPN·프록시 설정을 따릅니다.
 - **현재 기본 기능의 수집 범위:** 다른 프로그램의 패킷 본문·암호·쿠키를 수집하지 않습니다. 앱이 HTTPS 검사 요청에 로그인 정보나 쿠키를 추가하지 않으며 응답 본문을 저장하지 않습니다.
-- **배포와 Git:** 공개 EXE에는 개발자의 개인 측정 기록·테스트 결과·분석 자료가 포함되지 않습니다. 로컬 기록과 생성 산출물은 `.gitignore`로 제외하며, 배포 시 실행 파일만 전달합니다.
+- **배포와 Git:** 공개 EXE에는 개발자의 개인 측정 기록·테스트 결과·분석 자료가 포함되지 않습니다. 로컬 기록과 생성 산출물은 `.gitignore`로 제외합니다. 릴리스에는 EXE와 공개 CI의 해시·출처 증명 자료만 첨부합니다.
 
 ## 빌드와 검증
 
@@ -114,7 +136,7 @@ HTTPS는 Windows/.NET의 기본 인증서 검증과 프록시 설정을 사용�
 
 버전별 EXE·테스트 실행 사본·ZIP 백업은 만들지 않습니다. 업데이트는 같은 `PcInternetMonitor.exe`를 교체하며 이미 열린 사용자 창은 강제로 닫지 않습니다. 새 버전은 기존 앱을 완전히 종료한 뒤 다시 실행할 때 적용됩니다.
 
-배포용 EXE는 [GitHub Releases](https://github.com/JooWon0712/pc-internet-monitor/releases)에 첨부합니다. 실행 파일과 로컬 기록·테스트 산출물은 `.gitignore`로 Git 추적 대상에서 제외합니다.
+배포용 EXE는 공개 CI에서 빌드·검사·출처 증명 생성 후 [GitHub Releases](https://github.com/JooWon0712/pc-internet-monitor/releases)에 첨부합니다. 실행 파일과 로컬 기록·테스트 산출물은 `.gitignore`로 Git 추적 대상에서 제외합니다. 로컬 빌드는 개발 확인용이며 CI 릴리스 파일을 대체하지 않습니다.
 
 검사 모드는 고정 EXE를 사용하며 실행마다 고유한 `tests/.run-<GUID>/` 폴더에 테스트 기록·화면·진단 자료를 모읍니다. 검사가 정상 또는 실패로 종료되면 해당 실행이 만든 임시 폴더만 자동 정리합니다. 자식 프로세스를 쓰는 검사는 부모 실행의 임시 폴더를 함께 사용하고 부모가 종료할 때 정리합니다. 실제 `logs/`·`diagnostics/`, 기존 파일과 재사용 가능한 C# 테스트 소스는 정리 대상이 아닙니다.
 
