@@ -13,7 +13,7 @@ namespace PcInternetMonitor
 {
     public static class App
     {
-        public const string Version = "0.2.8";
+        public const string Version = "0.2.9";
         private static string exitContext = "명시적 종료 요청 미확인";
         private static volatile bool unhandledExceptionSeen;
         private static TestRunScope testRun;
@@ -88,7 +88,7 @@ namespace PcInternetMonitor
                     AdapterCounterTotals.SelfTest(); MeasurementQuality.SelfTest();
                     FinalSnapshotTests.SelfTest(testDir);
                     GameCheckPresentation.SelfTest(); TcpRttMonitor.SelfTest(); TcpRttLoggingTests.SelfTest(testDir); TcpRttPresentation.SelfTest();
-                    InternetCheckRunner.SelfTest(); ConnectivityHistory.SelfTest(); InternetLoggingTests.SelfTest(testDir); SessionClockGuard.SelfTest(); ClockGuardTests.SelfTest(testDir); GatewayRefreshTests.SelfTest();
+                    InternetCheckRunner.SelfTest(); ConnectivityHistory.SelfTest(); IncidentExplanationTests.Run(); InternetLoggingTests.SelfTest(testDir); SessionClockGuard.SelfTest(); ClockGuardTests.SelfTest(testDir); GatewayRefreshTests.SelfTest();
                     Directory.CreateDirectory(testDir);
                     File.WriteAllText(Path.Combine(testDir, "self-test.txt"), "PASS v" + Version + ": DNS/HTTPS timeout/cancel/generation/freshness, connectivity failure/recovery/gap/history, CSV dedup/flush/archive/PC summary, retained ETW/probe/adapter/TCP RTT synthetic regression checks. No live network or performance validation in this test.\r\n", Encoding.UTF8);
                     return 0;

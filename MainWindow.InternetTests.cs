@@ -30,6 +30,7 @@ namespace PcInternetMonitor
             Require(values["dns"].Text == "조회 성공" && values["https"].Text == "접속 성공" && values["gateway"].Text == "1 ms 미만", "successful checks missing");
             Require(historyList.Items.Count >= 2 && history.GetRecent(10).Any(x => x.State == "recovered") && history.GetRecent(10).Any(x => x.State == "open"), "recovered and open histories missing");
             recordingDetail.Text = "합성 화면 예시 · 실제 인터넷 검사 결과가 아닙니다."; RenderTestSurface(Path.Combine(directory, "internet-dashboard-example.png"), 1040, 740); CheckBounds(1040, 740);
+            HistoryGuidancePresentationTest(directory, at);
             for (int i = 0; i < 110; i++) archived.Add(new ConnectivityIncident { Id = Guid.NewGuid().ToString("N"), Version = 1, Kind = "dns", Target = DefaultDnsHost, Category = "failure", Scope = "DNS", Summary = "이전 기록 합성 예시", State = "ended", StartedUtc = at.AddMinutes(-i - 1), LastObservedUtc = at.AddMinutes(-i - 1).AddSeconds(10), ClosedUtc = at.AddMinutes(-i - 1).AddSeconds(10), Failures = 2 });
             historyDirty = true; RefreshHistory(); Require(historyList.Items.Count == 100, "history display cap missing"); historyList.ScrollIntoView(historyList.Items[99]); RenderTestSurface(Path.Combine(directory, "internet-history-scrolled.png"), 960, 660); CheckBounds(960, 660);
             archived.Clear(); historyDirty = true;
