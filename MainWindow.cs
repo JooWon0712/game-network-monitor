@@ -57,6 +57,7 @@ namespace PcInternetMonitor
             controller.GatewayTargetChanged += RecordGatewayTargetChanged; controller.ProbeSampled += RecordProbe; internet.Sampled += RecordInternetCheck; history.Changed += RecordIncident;
             timer.Interval = TimeSpan.FromSeconds(1); timer.Tick += delegate { Poll(); };
             Closing += HandleWindowClosing;
+            StateChanged += HandleWindowStateChanged;
             Closed += delegate { DisposeMonitor(); DiagnosticsLog.Write("window_closed", "session=" + lastDirectory); };
             SetControls(); RefreshPresentation(); LoadHistory();
         }
@@ -77,6 +78,7 @@ namespace PcInternetMonitor
         private void StartSession()
         {
             if (running || disposed) return;
+            if (WindowState == WindowState.Minimized) { notice = "창을 복원한 뒤 검사 시작을 눌러 주세요."; RefreshPresentation(); return; }
             AdapterInfo selected = adapterPicker.SelectedItem as AdapterInfo;
             if (selected == null) { notice = "확인할 PC 연결을 선택하세요."; RefreshPresentation(); return; }
             try
@@ -195,15 +197,13 @@ namespace PcInternetMonitor
         internal void AllowSystemShutdown() { sessionEnding = true; }
         private void HandleWindowClosing(object sender, System.ComponentModel.CancelEventArgs e)
         {
-            if (!appExitRequested && !sessionEnding && !disposed && HideToBackground()) { e.Cancel = true; return; }
-            NotifyBackgroundClosing();
             App.NoteExitRequest(sessionEnding ? "Windows 종료 요청" : appExitRequested ? "앱 종료 요청" : "창 닫기 요청");
             DiagnosticsLog.Write("window_closing", "recording=" + running + "; session_ending=" + sessionEnding + "; explicit_exit=" + appExitRequested);
             DisposeMonitor();
         }
         private void SetControls() { startButton.IsEnabled = !running && !disposed; stopButton.IsEnabled = running && !disposed; adapterPicker.IsEnabled = refreshButton.IsEnabled = !running; exitButton.IsEnabled = !disposed && !appExitRequested; }
         private void OpenLogFolder() { try { string path = lastDirectory.Length == 0 ? logRoot : lastDirectory; Directory.CreateDirectory(path); Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); } catch (Exception error) { notice = "기록 폴더 열기 실패: " + error.Message; RefreshPresentation(); } }
-        private void DisposeMonitor() { if (disposed) return; try { StopSession(sessionEnding ? "Windows 종료" : appExitRequested ? "앱 종료" : "창 닫기", null); } finally { disposed = true; backgroundReady = false; timer.Stop(); internet.Dispose(); controller.Dispose(); } }
+        private void DisposeMonitor() { if (disposed) return; try { StopSession(sessionEnding ? "Windows 종료" : appExitRequested ? "앱 종료" : "창 닫기", null); } finally { disposed = true; timer.Stop(); internet.Dispose(); controller.Dispose(); } }
         private static SolidColorBrush Brush(Color color) { SolidColorBrush b = new SolidColorBrush(color); b.Freeze(); return b; }
         private static TextBlock Text(string value, double size, Color color, bool bold) { return new TextBlock { Text = value, FontSize = size, Foreground = Brush(color), FontWeight = bold ? FontWeights.SemiBold : FontWeights.Normal, TextWrapping = TextWrapping.Wrap }; }
         private static string Ms(double value) { return value == 0 ? "1 ms 미만" : value.ToString("N1", CultureInfo.CurrentCulture) + " ms"; }
